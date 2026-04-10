@@ -5,15 +5,15 @@
 //          ngrok http 3000
 // ============================================================
 
-require('dotenv').config();        // loads .env.local automatically
+require('dotenv').config({ path: '.env.local' });        // loads .env.local explicitly
 const express = require('express');
-const cors    = require('cors');    // <--- Add this
-const axios   = require('axios');
+const cors = require('cors');    // <--- Add this
+const axios = require('axios');
 
 const app = express();
 
 // 1. Enable CORS for all origins
-app.use(cors()); 
+app.use(cors());
 
 // 2. Keep your ngrok bypass header
 app.use((_req, res, next) => {
@@ -24,19 +24,22 @@ app.use((_req, res, next) => {
 app.use(express.json());
 
 // ── Configuration (all values come from .env.local) ─────────
-const AGORA_APP_ID   = process.env.AGORA_APP_ID;        // 43255fc9405c4e4dbeae512d2700d917
-const AGORA_TOKEN    = process.env.AGORA_TOKEN;          // agora token=007eJx...
-const AGORA_RTC_TOKEN = process.env.AGORA_RTC_TOKEN;    // RTC token for the channel
-const AGORA_PIPELINE_ID = process.env.AGORA_PIPELINE_ID; // 1ff64a4474604469874405f1d681160e
-const NGROK_URL      = process.env.NGROK_URL;            // https://xxxx.ngrok-free.app
+const AGORA_APP_ID = process.env.AGORA_APP_ID;
+const AGORA_AUTH = Buffer.from(
+  `${process.env.AGORA_CUSTOMER_ID}:${process.env.AGORA_CUSTOMER_SECRET}`
+).toString('base64');
+
+const AGORA_RTC_TOKEN = process.env.AGORA_RTC_TOKEN;
+const AGORA_PIPELINE_ID = process.env.AGORA_PIPELINE_ID; // stores your Deepgram/OpenAI/MiniMax keys
+const NGROK_URL = process.env.NGROK_URL;
 
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN;       // your-store.myshopify.com
-const SHOPIFY_TOKEN  = process.env.SHOPIFY_STOREFRONT_TOKEN; // shpat_xxxx
+const SHOPIFY_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN; // shpat_xxxx
 
 // ── Startup guard ────────────────────────────────────────────
 const REQUIRED_VARS = [
-  'AGORA_APP_ID', 'AGORA_TOKEN', 'AGORA_RTC_TOKEN',
-  'AGORA_PIPELINE_ID', 'NGROK_URL', 'SHOPIFY_DOMAIN', 'SHOPIFY_STOREFRONT_TOKEN',
+  'AGORA_APP_ID', 'AGORA_CUSTOMER_ID', 'AGORA_CUSTOMER_SECRET',
+  'AGORA_RTC_TOKEN', 'AGORA_PIPELINE_ID', 'NGROK_URL', 'SHOPIFY_DOMAIN', 'SHOPIFY_STOREFRONT_TOKEN',
 ];
 const missing = REQUIRED_VARS.filter(k => !process.env[k]);
 if (missing.length) {
@@ -51,38 +54,38 @@ if (missing.length) {
 // ============================================================
 app.post('/api/start-el', async (req, res) => {
   // Accept optional overrides from the frontend; fall back to your Studio defaults
-  const channel   = req.body?.channel   || 'echo-mart-dev';
-  const remoteUid = req.body?.uid       || '123';   // must match uid in Liquid code
+  const channel = req.body?.channel || 'echo-mart-dev';
+  const remoteUid = '123';   // must match uid in Liquid code
 
   console.log(`\n🟢  /api/start-el  channel="${channel}"  remoteUid="${remoteUid}"`);
 
   // ── Agora v2.5 Join payload ───────────────────────────────
   // Mirrors your curl exactly. pipeline_id pulls the saved agent config
-  // from Agora Studio; properties here override only the dynamic fields.
+  // Mirrors your curl exactly.
   const agoraPayload = {
     name: `El_Assistant_${Date.now()}`,  // must be unique per-call
-    pipeline_id: AGORA_PIPELINE_ID,
+    pipeline_id: AGORA_PIPELINE_ID,     // ← holds your Deepgram/OpenAI/MiniMax credentials
 
     properties: {
       channel,
-      token:            AGORA_RTC_TOKEN,
-      agent_rtc_uid:    '715636',
-      remote_rtc_uids:  [remoteUid],
+      token: AGORA_RTC_TOKEN,
+      agent_rtc_uid: '715636',
+      remote_rtc_uids: [remoteUid],
       enable_string_uid: false,
-      idle_timeout:     120,
+      idle_timeout: 120,
 
       asr: {
         vendor: 'deepgram',
         params: {
-          url:      'wss://api.deepgram.com/v1/listen',
-          model:    'nova-3',
-          keyterm:  '',
+          url: 'wss://api.deepgram.com/v1/listen',
+          model: 'nova-3',
+          keyterm: '',
           language: 'en',
         },
       },
 
       llm: {
-        url:    'https://api.openai.com/v1/chat/completions',
+        url: 'https://api.openai.com/v1/chat/completions',
         vendor: 'openai',
         params: { model: 'gpt-4.1-mini' },
         failure_message: 'Please hold on a second.',
@@ -111,12 +114,22 @@ app.post('/api/start-el', async (req, res) => {
           ].join('\n'),
         }],
         greeting_message: 'Welcome! I am El, your personal shopping assistant. How can I help you?',
+
+        // ── Tool: search_catalog ────────────────────────────────
+        // Agora calls this MCP endpoint when El invokes search_catalog.
+        // The endpoint below implements the MCP Streamable-HTTP protocol.
+        mcp_servers: [{
+          name: 'echomart-catalog',
+          transport: 'streamable_http',
+          endpoint: `${NGROK_URL}/api/shopify-search`,
+          allowed_tools: ['search_catalog'],
+        }],
       },
 
       tts: {
         vendor: 'minimax',
         params: {
-          url:   'wss://api-uw.minimax.io/ws/v1/t2a_v2',
+          url: 'wss://api-uw.minimax.io/ws/v1/t2a_v2',
           model: 'speech-2.8-turbo',
           voice_setting: {
             voice_id: 'English_radiant_girl',
@@ -125,14 +138,14 @@ app.post('/api/start-el', async (req, res) => {
       },
 
       sal: {
-        sal_mode:    'locking',
+        sal_mode: 'locking',
         sample_urls: {},
       },
 
       parameters: {
         silence_config: {
-          action:     'think',
-          content:    'politely ask if the user is still online',
+          action: 'think',
+          content: 'politely ask if the user is still online',
           timeout_ms: 10000,
         },
       },
@@ -142,6 +155,7 @@ app.post('/api/start-el', async (req, res) => {
       advanced_features: {
         enable_rtm: true,
         enable_sal: true,
+        enable_tools: true,   // required for MCP tool invocation
       },
     },
   };
@@ -152,8 +166,7 @@ app.post('/api/start-el', async (req, res) => {
       agoraPayload,
       {
         headers: {
-          // Auth style from your curl: "agora token=007eJx..."
-          Authorization:  `agora token=${AGORA_TOKEN}`,
+          Authorization: `Basic ${AGORA_AUTH}`,
           'Content-Type': 'application/json',
         },
       }
@@ -170,68 +183,129 @@ app.post('/api/start-el', async (req, res) => {
 });
 
 // ============================================================
-//  ENDPOINT 2: /api/shopify-search
-//  El calls this via MCP whenever it needs to search products.
-//  Agora sends: { arguments: { query: "blue running shoes" } }
+//  ENDPOINT 2: /api/shopify-search  (MCP Streamable-HTTP)
+//  Implements the full MCP JSON-RPC handshake Agora requires:
+//    initialize → tools/list → tools/call
 // ============================================================
 app.post('/api/shopify-search', async (req, res) => {
-  const query = req.body?.arguments?.query || '';
-  console.log(`\n🔍  El is searching for: "${query}"`);
+  const { method, params, id } = req.body || {};
 
-  if (!query.trim()) {
-    return res.json({ result: 'Please tell me what you\'re looking for.' });
+  // Log every incoming request so we can see what Agora sends
+  console.log(`\n📨  MCP request → method: "${method}" id: ${id}`);
+  if (params) console.log('    params:', JSON.stringify(params, null, 2));
+
+  // ── MCP: initialize handshake (Agora sends this first) ─────
+  if (method === 'initialize') {
+    return res.json({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'echomart-catalog', version: '1.0.0' },
+      },
+    });
   }
 
-  const graphqlQuery = {
-    query: `{
-      search(query: "${query.replace(/"/g, '\\"')}", first: 3, types: PRODUCT) {
-        nodes {
-          ... on Product {
-            title
-            variants(first: 1) {
-              nodes {
-                price { amount currencyCode }
+  // ── MCP: initialized notification (no response needed) ──────
+  if (method === 'notifications/initialized') {
+    return res.status(200).end();
+  }
+
+  // ── MCP: tool discovery ────────────────────────────────────
+  if (method === 'tools/list') {
+    return res.json({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        tools: [{
+          name: 'search_catalog',
+          description: 'Search for products in the EchoMart Shopify store by keyword.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'Product search keyword, e.g. "blue sneakers"' },
+            },
+            required: ['query'],
+          },
+        }],
+      },
+    });
+  }
+
+  // ── MCP: tool invocation ───────────────────────────────────
+  if (method === 'tools/call' && params?.name === 'search_catalog') {
+    const query = params?.arguments?.query || '';
+    console.log(`\n🔍  El is searching for: "${query}"`);
+
+    if (!query.trim()) {
+      return res.json({
+        jsonrpc: '2.0', id,
+        result: { content: [{ type: 'text', text: "Please tell me what you're looking for." }] },
+      });
+    }
+
+    const graphqlQuery = {
+      query: `{
+        search(query: "${query.replace(/"/g, '\\"')}", first: 3, types: PRODUCT) {
+          nodes {
+            ... on Product {
+              title
+              variants(first: 1) {
+                nodes { price { amount currencyCode } }
               }
             }
           }
         }
-      }
-    }`,
-  };
+      }`,
+    };
 
-  try {
-    const shopifyRes = await axios.post(
-      `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
-      graphqlQuery,
-      {
-        headers: {
-          'Content-Type':                    'application/json',
-          'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN,
-        },
-      }
-    );
+    try {
+      const shopifyRes = await axios.post(
+        `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
+        graphqlQuery,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN,
+          },
+        }
+      );
 
-    const nodes    = shopifyRes.data?.data?.search?.nodes || [];
-    const products = nodes
-      .filter(p => p.title)
-      .map(p => {
-        const price    = p.variants?.nodes?.[0]?.price;
-        const priceStr = price ? `$${parseFloat(price.amount).toFixed(2)} ${price.currencyCode}` : 'price unavailable';
-        return `${p.title} at ${priceStr}`;
+      const nodes = shopifyRes.data?.data?.search?.nodes || [];
+      const products = nodes
+        .filter(p => p.title)
+        .map(p => {
+          const price = p.variants?.nodes?.[0]?.price;
+          const priceStr = price ? `$${parseFloat(price.amount).toFixed(2)} ${price.currencyCode}` : 'price unavailable';
+          return `${p.title} at ${priceStr}`;
+        });
+
+      const text = products.length
+        ? `Found ${products.length} product${products.length > 1 ? 's' : ''}: ${products.join('; ')}.`
+        : "No matching products found. Try a different search term.";
+
+      console.log('✅  Shopify result:', text);
+      return res.json({
+        jsonrpc: '2.0', id,
+        result: { content: [{ type: 'text', text }] },
       });
 
-    const result = products.length
-      ? `I found ${products.length} product${products.length > 1 ? 's' : ''}: ${products.join('; ')}.`
-      : "I couldn't find any matching products. Try a different search term.";
-
-    console.log('✅  Shopify result:', result);
-    res.json({ result });
-
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error('❌  Shopify error:', JSON.stringify(detail, null, 2));
-    res.json({ result: 'I had trouble searching the store right now. Please try again.' });
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      console.error('❌  Shopify error:', JSON.stringify(detail, null, 2));
+      return res.json({
+        jsonrpc: '2.0', id,
+        result: { content: [{ type: 'text', text: 'I had trouble searching the store. Please try again.' }] },
+      });
+    }
   }
+
+  // ── Unknown MCP method ─────────────────────────────────────
+  res.status(400).json({
+    jsonrpc: '2.0', id,
+    error: { code: -32601, message: `Method not found: ${method}` },
+  });
 });
 
 // ── Health check ─────────────────────────────────────────────
