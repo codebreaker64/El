@@ -218,96 +218,186 @@ app.post('/api/shopify-search', async (req, res) => {
       jsonrpc: '2.0',
       id,
       result: {
-        tools: [{
-          name: 'search_catalog',
-          description: 'Search for products in the EchoMart Shopify store by keyword.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              query: { type: 'string', description: 'Product search keyword, e.g. "blue sneakers"' },
+        tools: [
+          {
+            name: 'search_catalog',
+            description: 'Search EchoMart products. Supports price queries like "most expensive" or "cheapest".',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'Search term, e.g. "snowboard" or "most expensive snowboard"' },
+              },
+              required: ['query'],
             },
-            required: ['query'],
           },
-        }],
+          {
+            name: 'create_cart',
+            description: 'Add a product to the shopping cart and return a checkout URL.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                product_title: { type: 'string', description: 'The product title to add to cart' },
+                quantity: { type: 'number', description: 'How many to add (default: 1)' },
+              },
+              required: ['product_title'],
+            },
+          },
+        ],
       },
     });
   }
 
-  // ── MCP: tool invocation ───────────────────────────────────
-  if (method === 'tools/call' && params?.name === 'search_catalog') {
-    const query = params?.arguments?.query || '';
-    console.log(`\n🔍  El is searching for: "${query}"`);
+  // ── MCP: search_catalog ────────�    // ── Detect price intent — use Shopify API-level sorting ──────
+  if (method === 'tools/call' && params && params.name === 'search_catalog') {
+    const query = (params.arguments && params.arguments.query) || '';
+    console.log('[search] query:', query);
 
     if (!query.trim()) {
-      return res.json({
-        jsonrpc: '2.0', id,
-        result: { content: [{ type: 'text', text: "Please tell me what you're looking for." }] },
-      });
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: "Please tell me what you're looking for." }] } });
     }
 
-    const graphqlQuery = {
-      query: `{
-        search(query: "${query.replace(/"/g, '\\"')}", first: 3, types: PRODUCT) {
+    const isExpensive = /expensive|most expensive|priciest|highest price/i.test(query);
+  const isCheapest = /cheap|cheapest|lowest price|affordable|budget/i.test(query);
+  const sortKey = (isExpensive || isCheapest) ? 'PRICE' : 'RELEVANCE';
+  const reverse = isExpensive;   // true = most expensive first
+
+  // Strip price adjectives so Shopify searches by product type
+  const searchTerm = query
+    .replace(/most expensive|expensive|priciest|highest price|cheapest|cheap|lowest price|affordable|budget/gi, '')
+    .trim();
+
+  const gql = {
+    query: `{
+        products(
+          first: 5,
+          sortKey: ${sortKey},
+          reverse: ${reverse}${searchTerm ? `,\n          query: "${searchTerm.replace(/"/g, '\\"')}"` : ''}
+        ) {
           nodes {
-            ... on Product {
-              title
-              variants(first: 1) {
-                nodes { price { amount currencyCode } }
+            title
+            handle
+            variants(first: 1) {
+              nodes {
+                id
+                price { amount currencyCode }
               }
             }
           }
         }
       }`,
-    };
+  };
+
+  try {
+    const sfRes = await axios.post(
+      `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
+      gql,
+      { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
+    );
+
+    if (sfRes.data?.errors) {
+      console.error('❌  Storefront API errors:', JSON.stringify(sfRes.data.errors, null, 2));
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'The store is unavailable right now. Please try again.' }] } });
+    }
+
+    const top = (sfRes.data?.data?.products?.nodes || [])
+      .filter(p => p.title)
+      .slice(0, 3)
+      .map(p => {
+        const price = p.variants?.nodes?.[0]?.price;
+        const priceStr = price ? `$${parseFloat(price.amount).toFixed(2)} ${price.currencyCode}` : 'price unavailable';
+        return `${p.title} at ${priceStr}`;
+      });
+
+    const text = top.length
+      ? top.join('; ')
+      : 'No matching products found. Try searching for snowboard or wax.';
+
+    console.log('✅  Shopify result:', text);
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error('❌  Shopify error:', JSON.stringify(detail, null, 2));
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I had trouble searching the store. Please try again.' }] } });
+  }
+  } // end search_catalog
+
+  // ── MCP: create_cart ───────────────────────────────────
+  if (method === 'tools/call' && params && params.name === 'create_cart') {
+    const productTitle = (params.arguments && params.arguments.product_title) || '';
+    const quantity = parseInt((params.arguments && params.arguments.quantity) || 1, 10) || 1;
+    console.log('[cart] product="' + productTitle + '" qty=' + quantity);
 
     try {
-      const shopifyRes = await axios.post(
-        `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
-        graphqlQuery,
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN,
-          },
-        }
+      // Step 1: Find the product variant GID via Storefront API
+      const searchGql = {
+        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\"') + '") { nodes { title handle variants(first: 1) { nodes { id price { amount currencyCode } } } } } }',
+      };
+      const searchRes = await axios.post(
+        'https://' + SHOPIFY_DOMAIN + '/api/2025-04/graphql.json',
+        searchGql,
+        { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
       );
 
-      const nodes = shopifyRes.data?.data?.search?.nodes || [];
-      const products = nodes
-        .filter(p => p.title)
-        .map(p => {
-          const price = p.variants?.nodes?.[0]?.price;
-          const priceStr = price ? `$${parseFloat(price.amount).toFixed(2)} ${price.currencyCode}` : 'price unavailable';
-          return `${p.title} at ${priceStr}`;
-        });
+      const product = searchRes.data && searchRes.data.data && searchRes.data.data.products && searchRes.data.data.products.nodes && searchRes.data.data.products.nodes[0];
+      if (!product) {
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I could not find "' + productTitle + '" in the store. Please try the exact product name.' }] } });
+      }
 
-      const text = products.length
-        ? `Found ${products.length} product${products.length > 1 ? 's' : ''}: ${products.join('; ')}.`
-        : "No matching products found. Try a different search term.";
+      const variantNode = product.variants && product.variants.nodes && product.variants.nodes[0];
+      const variantGid = variantNode && variantNode.id;
+      if (!variantGid) {
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: product.title + ' has no purchasable variant right now.' }] } });
+      }
 
-      console.log('✅  Shopify result:', text);
-      return res.json({
-        jsonrpc: '2.0', id,
-        result: { content: [{ type: 'text', text }] },
-      });
+      // Step 2: cartCreate mutation (Storefront API)
+      const cartGql = {
+        query: 'mutation cartCreate($input: CartInput!) { cartCreate(input: $input) { cart { id checkoutUrl cost { totalAmount { amount currencyCode } } } userErrors { field message } } }',
+        variables: { input: { lines: [{ quantity: quantity, merchandiseId: variantGid }] } },
+      };
+      const cartRes = await axios.post(
+        'https://' + SHOPIFY_DOMAIN + '/api/2025-04/graphql.json',
+        cartGql,
+        { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
+      );
+
+      const userErrors = cartRes.data && cartRes.data.data && cartRes.data.data.cartCreate && cartRes.data.data.cartCreate.userErrors;
+      if (userErrors && userErrors.length) {
+        const errMsg = userErrors.map(function(e) { return e.message; }).join(', ');
+        console.error('[cart] userErrors:', errMsg);
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Cart error: ' + errMsg }] } });
+      }
+
+      const cart = cartRes.data && cartRes.data.data && cartRes.data.data.cartCreate && cartRes.data.data.cartCreate.cart;
+      if (!cart) {
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Could not create a cart right now. Please try again.' }] } });
+      }
+
+      const priceNode = variantNode && variantNode.price;
+      const unitPrice = priceNode ? ('$' + parseFloat(priceNode.amount).toFixed(2) + ' ' + priceNode.currencyCode) : '';
+      const totalNode = cart.cost && cart.cost.totalAmount;
+      const totalPrice = totalNode ? ('$' + parseFloat(totalNode.amount).toFixed(2) + ' ' + totalNode.currencyCode) : '';
+
+      const text = 'I have added ' + quantity + ' x ' + product.title
+        + (unitPrice ? ' at ' + unitPrice + ' each' : '')
+        + (totalPrice ? '. Your cart total is ' + totalPrice : '')
+        + '. Here is your checkout link: ' + cart.checkoutUrl;
+
+      console.log('[cart] checkoutUrl:', cart.checkoutUrl);
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: text }] } });
 
     } catch (err) {
-      const detail = err.response?.data || err.message;
-      console.error('❌  Shopify error:', JSON.stringify(detail, null, 2));
-      return res.json({
-        jsonrpc: '2.0', id,
-        result: { content: [{ type: 'text', text: 'I had trouble searching the store. Please try again.' }] },
-      });
+      const detail = err.response && err.response.data ? err.response.data : err.message;
+      console.error('[cart] error:', JSON.stringify(detail, null, 2));
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I had trouble creating your cart. Please try again.' }] } });
     }
   }
 
-  // ── Unknown MCP method ─────────────────────────────────────
   res.status(400).json({
     jsonrpc: '2.0', id,
     error: { code: -32601, message: `Method not found: ${method}` },
   });
 });
-
 // ── Health check ─────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ngrok: NGROK_URL }));
 
