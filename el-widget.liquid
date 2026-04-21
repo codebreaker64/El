@@ -1,0 +1,922 @@
+<!-- ============================================================
+  El Voice Assistant Widget  v3
+  Paste into Shopify theme.liquid before </body>
+  ============================================================ -->
+
+<div id="el-assistant-root">
+
+  <!-- Chat window -->
+  <div id="el-chat-container">
+    <div id="el-chat-header">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="white" stroke-width="1.5"/>
+          <path d="M8 12.5C8 12.5 9.5 15 12 15C14.5 15 16 12.5 16 12.5" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+          <circle cx="9.5" cy="10" r="1" fill="white"/>
+          <circle cx="14.5" cy="10" r="1" fill="white"/>
+        </svg>
+        <span style="font-weight:700;font-size:15px;">El – Shopping Assistant</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span id="el-status-text" style="font-size:11px;opacity:0.65;">Connecting…</span>
+        <span id="el-status-dot"></span>
+      </div>
+    </div>
+
+    <div id="el-chat-messages">
+      <div class="el-msg-row el-row-ai">
+        <span class="el-sender-lbl">El</span>
+        <div class="el-msg-bubble el-msg-ai">Waking up El…</div>
+      </div>
+    </div>
+
+    <div id="el-mic-strip">
+      <div id="el-bars">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <span id="el-mic-label">Listening…</span>
+    </div>
+  </div>
+
+  <!-- Toggle button -->
+  <button id="el-button" aria-label="Talk to El">
+    <svg id="el-mic-icon" width="28" height="28" viewBox="0 0 24 24" fill="none">
+      <rect x="9" y="2" width="6" height="11" rx="3" fill="white"/>
+      <path d="M5 10C5 14.418 8.134 18 12 18C15.866 18 19 14.418 19 10" stroke="white" stroke-width="2" stroke-linecap="round"/>
+      <line x1="12" y1="18" x2="12" y2="22" stroke="white" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <svg id="el-stop-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" style="display:none;">
+      <rect x="5" y="5" width="14" height="14" rx="3" fill="white"/>
+    </svg>
+  </button>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!--  STYLES                                                -->
+<!-- ══════════════════════════════════════════════════════ -->
+<style>
+  #el-assistant-root {
+    position: fixed; bottom: 28px; right: 28px; z-index: 999999;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 14px;
+  }
+
+  /* Chat container */
+  #el-chat-container {
+    width: 360px; height: 520px;
+    background: #fff; border-radius: 22px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.22), 0 4px 16px rgba(0,0,0,.1);
+    display: none; flex-direction: column; overflow: hidden;
+    border: 1px solid rgba(0,0,0,.08);
+    opacity: 0; transform: translateY(16px) scale(.97);
+    transition: opacity .25s ease, transform .25s ease;
+  }
+  #el-chat-container.el-open { opacity: 1; transform: translateY(0) scale(1); }
+
+  /* Header */
+  #el-chat-header {
+    padding: 14px 18px; background: #111; color: #fff;
+    display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+  }
+  #el-status-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: #ff3b30;
+    display: inline-block; animation: el-pulse 1.6s ease-in-out infinite;
+  }
+  #el-status-dot.el-connected { background: #34c759; }
+
+  /* Messages area */
+  #el-chat-messages {
+    flex: 1; padding: 14px 14px 8px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 8px;
+    background: #f5f5f7; scroll-behavior: smooth;
+  }
+  #el-chat-messages::-webkit-scrollbar { width: 5px; }
+  #el-chat-messages::-webkit-scrollbar-track { background: transparent; }
+  #el-chat-messages::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+
+  /* Message rows – hold sender label + bubble */
+  .el-msg-row {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .el-row-ai  { align-items: flex-start; }
+  .el-row-user{ align-items: flex-end;   }
+
+  /* Sender label */
+  .el-sender-lbl {
+    font-size: 11px; font-weight: 700; color: #999;
+    padding: 0 4px;
+  }
+
+  /* Bubbles */
+  .el-msg-bubble {
+    padding: 10px 14px; border-radius: 18px;
+    max-width: 82%; font-size: 14px; line-height: 1.45;
+    word-wrap: break-word; animation: el-pop .2s ease;
+  }
+  .el-msg-ai   { background: #e8e8ed; color: #1c1c1e; border-bottom-left-radius: 6px; }
+  .el-msg-user { background: #007aff; color: #fff;     border-bottom-right-radius: 6px; }
+
+  /* Product card (legacy standalone – kept for safety) */
+  .el-product-card {
+    align-self: flex-start; background: #fff;
+    border: 1px solid #e0e0e0; border-radius: 14px; overflow: hidden;
+    width: 180px; box-shadow: 0 2px 10px rgba(0,0,0,.09); animation: el-pop .25s ease;
+  }
+  .el-product-card img { width: 100%; height: 130px; object-fit: cover; display: block; }
+  .el-product-card-info { padding: 10px 12px; }
+  .el-product-card-title { font-weight: 600; font-size: 12px; color: #111; margin-bottom: 3px; line-height: 1.3; }
+  .el-product-card-price { font-size: 12px; color: #555; }
+
+  /* Product embed — lives INSIDE El's bubble */
+  .el-product-embed {
+    margin-top: 10px; border-radius: 12px; overflow: hidden;
+    background: #fff; border: 1px solid rgba(0,0,0,.1);
+    animation: el-pop .25s ease;
+  }
+  .el-product-embed img {
+    width: 100%; max-height: 180px; object-fit: cover; display: block;
+  }
+  .el-product-embed-info {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 8px 10px; gap: 8px;
+  }
+  .el-product-embed-title { font-weight: 600; font-size: 12px; color: #111; line-height: 1.3; }
+  .el-product-embed-price { font-size: 12px; color: #555; white-space: nowrap; }
+
+  /* Checkout button */
+  .el-checkout-wrap { align-self: stretch; padding: 4px 0; animation: el-pop .25s ease; }
+  .el-checkout-btn {
+    display: block; background: #111; color: #fff; text-decoration: none;
+    padding: 12px 20px; border-radius: 50px; font-size: 14px; font-weight: 600;
+    text-align: center; width: 100%; box-sizing: border-box;
+    transition: background .18s, transform .1s;
+  }
+  .el-checkout-btn:hover  { background: #333; transform: translateY(-1px); }
+  .el-checkout-btn:active { transform: translateY(0); }
+
+  /* Mic strip */
+  #el-mic-strip {
+    display: none; align-items: center; justify-content: center; gap: 10px;
+    padding: 10px 18px; background: #f5f5f7; border-top: 1px solid #e5e5ea; flex-shrink: 0;
+  }
+  #el-mic-strip.el-listening { display: flex; }
+  #el-bars { display: flex; gap: 3px; align-items: center; height: 20px; }
+  #el-bars span {
+    display: block; width: 3px; background: #007aff; border-radius: 2px;
+    animation: el-bar .8s ease-in-out infinite alternate;
+  }
+  #el-bars span:nth-child(1){ height:6px;  animation-delay:.0s; }
+  #el-bars span:nth-child(2){ height:14px; animation-delay:.1s; }
+  #el-bars span:nth-child(3){ height:20px; animation-delay:.2s; }
+  #el-bars span:nth-child(4){ height:14px; animation-delay:.3s; }
+  #el-bars span:nth-child(5){ height:6px;  animation-delay:.4s; }
+  #el-mic-label { font-size: 12px; color: #555; }
+
+  /* Toggle button */
+  #el-button {
+    width: 66px; height: 66px; border-radius: 50%; border: none; background: #111;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 8px 24px rgba(0,0,0,.28); outline: none;
+    transition: all .3s cubic-bezier(.175,.885,.32,1.275);
+  }
+  #el-button:hover  { transform: scale(1.08); box-shadow: 0 12px 30px rgba(0,0,0,.32); }
+  #el-button:active { transform: scale(.95); }
+  #el-button.el-active       { background: #ff3b30; }
+  #el-button.el-active:hover { background: #e0342b; }
+
+  /* Animations */
+  @keyframes el-pulse {
+    0%,100% { opacity:1; transform:scale(1);   }
+    50%      { opacity:.5; transform:scale(.8); }
+  }
+  @keyframes el-pop {
+    from { opacity:0; transform:scale(.92) translateY(4px); }
+    to   { opacity:1; transform:scale(1)   translateY(0);   }
+  }
+  @keyframes el-bar {
+    from { transform:scaleY(.4); }
+    to   { transform:scaleY(1);  }
+  }
+</style>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!--  SDK                                                   -->
+<!-- ══════════════════════════════════════════════════════ -->
+<script src="https://download.agora.io/sdk/release/AgoraRTC_N.js" defer></script>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!--  EL LOGIC  v3                                          -->
+<!-- ══════════════════════════════════════════════════════ -->
+<script>
+window.addEventListener('load', function () {
+
+  /* ═══════════════════════════════════════════════════════
+     CONFIG  –  update AGORA_TOKEN each session
+     ═══════════════════════════════════════════════════════ */
+  const AGORA_APP_ID  = "43255fc9405c4e4dbeae512d2700d917";
+  const AGORA_CHANNEL = "echo-mart-dev";
+  const AGORA_TOKEN   = "007eJxTYJihnafs/FDUQ1Qm+uK30zMV7q7l5Sy3O2q3KeVA4dcgCU4FBhNjI1PTtGRLEwPTZJNUk5Sk1MRUU0OjFCNzA4MUS0PzT0XPMxsCGRnuigswMTJAIIjPy5CanJGvm5tYVKKbklrGwAAAzIAg2A==";
+  const BACKEND_URL   = "https://cartoon-banister-slain.ngrok-free.dev";
+  const BROWSER_UID   = 123;
+
+  /* ═══════════════════════════════════════════════════════
+     CLIENT + STATE
+     ═══════════════════════════════════════════════════════ */
+  const client    = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+  let localAudioTrack = null;
+  let isActive        = false;
+  let activeAgentId   = null;   // tracks the running Agora agent_id
+  let cartPollInterval = null;  // polls /api/cart-actions
+
+  /*
+   * BUFFER STATE
+   * Agora streams the AI response incrementally. Each packet contains the
+   * FULL accumulated text so far ("Sure," → "Sure, here is…").
+   * We buffer silently and only commit a bubble once the stream goes quiet
+   * for AI_FLUSH_DELAY ms, guaranteeing the chat shows the complete message.
+   */
+  const AI_FLUSH_DELAY = 900;   // ms of silence before committing AI message
+  let aiBuffer     = '';         // latest accumulated AI text
+  let aiFlushTmr   = null;       // timer that fires flushAiBuffer()
+  let aiTypingRow  = null;       // "El is typing…" placeholder row
+
+  /* Deduplication (guards against exact repeats) */
+  const seenMsgs = new Map();
+  const DEDUP_MS = 6000;
+
+  /* Checkout gate */
+  let userWantsCheckout = false;
+
+  /* ── DOM ────────────────────────────────────────────── */
+  const elBtn     = document.getElementById('el-button');
+  const chatBox   = document.getElementById('el-chat-container');
+  const msgArea   = document.getElementById('el-chat-messages');
+  const statusDot = document.getElementById('el-status-dot');
+  const statusTxt = document.getElementById('el-status-text');
+  const micStrip  = document.getElementById('el-mic-strip');
+  const micIcon   = document.getElementById('el-mic-icon');
+  const stopIcon  = document.getElementById('el-stop-icon');
+
+  /* ═══════════════════════════════════════════════════════
+     UTILITIES
+     ═══════════════════════════════════════════════════════ */
+  function norm(t)    { return t.toLowerCase().replace(/\s+/g,' ').trim(); }
+  function scrollEnd(){ msgArea.scrollTop = msgArea.scrollHeight; }
+
+  function setStatus(label, ok) {
+    if (statusTxt) statusTxt.textContent = label;
+    if (statusDot) statusDot.classList.toggle('el-connected', !!ok);
+  }
+
+  function isDup(text) {
+    // Key on *cleaned* text so [CART_ADD:...] tokens don't defeat dedup
+    const key = norm(cleanText(text)), now = Date.now();
+    if (seenMsgs.has(key) && now - seenMsgs.get(key) < DEDUP_MS) return true;
+    seenMsgs.forEach((v,k) => { if (now-v > DEDUP_MS*2) seenMsgs.delete(k); });
+    seenMsgs.set(key, now);
+    return false;
+  }
+
+  function resetAiBuffer() {
+    clearTimeout(aiFlushTmr);
+    aiFlushTmr = null;
+    aiBuffer = '';
+    if (aiTypingRow) { aiTypingRow.remove(); aiTypingRow = null; }
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     CART POLLING
+     The widget polls GET /api/cart-actions every 1.5 s while El is active.
+     The server queues actions when the MCP tool is invoked, and the widget
+     drains the queue and executes them via the Shopify AJAX API.
+     ═══════════════════════════════════════════════════════ */
+  function startCartPolling() {
+    if (cartPollInterval) return;
+    cartPollInterval = setInterval(async () => {
+      try {
+        const r = await fetch(
+          BACKEND_URL + '/api/cart-actions?channel=' + encodeURIComponent(AGORA_CHANNEL),
+          { headers: { 'ngrok-skip-browser-warning': 'true' } }
+        );
+        const { actions } = await r.json();
+        for (const action of (actions || [])) {
+          await executeCartSignal(action);
+        }
+      } catch (_) { /* network hiccup – retry next tick */ }
+    }, 1500);
+  }
+
+  function stopCartPolling() {
+    if (cartPollInterval) { clearInterval(cartPollInterval); cartPollInterval = null; }
+  }
+
+  function extractCheckout(text) {
+    const m = text.match(/https:\/\/[^\s]+\/cart\/c\/[^\s]+/);
+    return m ? m[0].replace(/[.,;)]+$/, '') : null;
+  }
+
+  function extractProductImgToken(text) {
+    // [PRODUCT_IMG:imageUrl|title|price]  — injected by server's search_catalog
+    const m = text.match(/\[PRODUCT_IMG:([^|\]]+)\|([^|\]]+)\|([^\]]*)\]/);
+    if (!m) return null;
+    return { imageUrl: m[1].trim(), title: m[2].trim(), price: m[3].trim() };
+  }
+
+  function cleanText(text) {
+    return text
+      .replace(/https:\/\/[^\s]+\/cart\/c\/[^\s]+/g, '')  // strip Storefront checkout URLs
+      .replace(/\[CART_(?:ADD|UPDATE):[^\]]+\]/g, '')        // strip cart signal tokens
+      .replace(/\[PRODUCT_IMG:[^\]]+\]/g, '')                // strip product image tokens
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     AJAX CART INTEGRATION
+     Shopify AJAX API: /cart/add.js and /cart/update.js
+     These run in the browser with the shopper's session,
+     so they update the theme's live cart (drawer + count).
+     ═══════════════════════════════════════════════════════ */
+
+  /** Extract cart signals embedded by the server in El's text. */
+  function extractCartSignals(text) {
+    const signals = [];
+    // [CART_ADD:numericVariantId:qty]
+    const addRx = /\[CART_ADD:(\d+):(\d+)\]/g;
+    let m;
+    while ((m = addRx.exec(text)) !== null) {
+      signals.push({ type: 'add', variantId: m[1], qty: parseInt(m[2], 10) });
+    }
+    // [CART_UPDATE:numericVariantId:qty]  (qty=0 means remove)
+    const updRx = /\[CART_UPDATE:(\d+):(\d+)\]/g;
+    while ((m = updRx.exec(text)) !== null) {
+      signals.push({ type: 'update', variantId: m[1], qty: parseInt(m[2], 10) });
+    }
+    return signals;
+  }
+
+  /**
+   * Sections to request with every cart mutation.
+   * Only request cart-icon-bubble to update the header count badge.
+   * Requesting cart-drawer causes the drawer to open and fire overlay events
+   * that freeze the Shopify page — avoid it.
+   */
+  const CART_SECTIONS = [
+    'cart-icon-bubble',   // header count badge (Dawn)
+    'cart-drawer',        // slide-out cart panel (Dawn)
+    'cart-items',         // cart page — line items
+    'cart-footer',        // cart page — subtotal + checkout
+  ];
+
+  /**
+   * Inject bundled section HTML that came back inside the cart API response.
+   * Surgically replaces existing DOM nodes so animations / open-state are preserved.
+   */
+  function injectCartSections(sections) {
+    if (!sections) return;
+    const parser = new DOMParser();
+
+    // ── Cart icon bubble (header count badge) ──────────────────────────
+    // Three states from the Shopify section response:
+    //  A) newEl (#cart-icon-bubble) found   → update its innerHTML (count > 0)
+    //  B) newEl null, .cart-count-bubble found → badge returned without wrapper; add/update it
+    //  C) newEl null, no badge in response  → cart empty; remove stale badge
+    if (sections['cart-icon-bubble'] !== undefined) {
+      const doc       = parser.parseFromString(sections['cart-icon-bubble'] || '', 'text/html');
+      const newEl     = doc.getElementById('cart-icon-bubble');
+      const newBadge  = doc.querySelector('.cart-count-bubble');
+      const existing  = document.getElementById('cart-icon-bubble');
+
+      if (existing) {
+        if (newEl) {
+          // Case A — normal update
+          existing.innerHTML = newEl.innerHTML;
+        } else if (newBadge) {
+          // Case B — wrapper missing but badge content exists; update or insert badge
+          const existBadge = existing.querySelector('.cart-count-bubble');
+          if (existBadge) {
+            existBadge.outerHTML = newBadge.outerHTML;
+          } else {
+            existing.appendChild(newBadge.cloneNode(true));
+          }
+        } else {
+          // Case C — empty cart; remove count badge only
+          existing.querySelectorAll('.cart-count-bubble').forEach(el => el.remove());
+        }
+        console.log('[El] Cart badge: "' + existing.textContent.trim() + '"');
+      } else if (newEl || newBadge) {
+        // Badge element not in DOM yet — inject into cart link
+        const cartLink = document.querySelector('a[href="/cart"]');
+        if (cartLink) cartLink.appendChild((newEl || newBadge).cloneNode(true));
+      }
+    }
+
+    // cart-drawer — replace drawer__inner ────────────────────────────
+    // Replaces everything inside <cart-drawer> but NOT the element itself,
+    // so its close/keyup listeners survive. <cart-drawer-items> is a custom
+    // element that re-runs connectedCallback when re-inserted, re-attaching
+    // quantity/delete listeners automatically.
+    // We also sync the "is-empty" class on <cart-drawer> itself — Dawn's CSS
+    // uses it to hide the items area, so it must match the new section HTML.
+    if (sections['cart-drawer']) {
+      const doc            = parser.parseFromString(sections['cart-drawer'], 'text/html');
+      const newInner       = doc.querySelector('.drawer__inner');
+      const newCartDrawer  = doc.querySelector('cart-drawer');
+      const existCartDrawer = document.querySelector('cart-drawer');
+      const existInner      = document.querySelector('cart-drawer .drawer__inner');
+
+      if (newInner && existInner) {
+        existInner.innerHTML = newInner.innerHTML;
+
+        // Sync is-empty on the host element (controls items visibility via CSS)
+        const isEmpty = newCartDrawer?.classList.contains('is-empty') ?? false;
+        if (existCartDrawer) existCartDrawer.classList.toggle('is-empty', isEmpty);
+
+        console.log('[El] cart drawer refreshed, isEmpty=' + isEmpty + ' ✓');
+      }
+    }
+
+    // Cart page sections ————————————————————————————————————
+    for (const sectionId of ['cart-items', 'cart-footer']) {
+      if (!sections[sectionId]) continue;
+      const doc      = parser.parseFromString(sections[sectionId], 'text/html');
+      const newSec   = doc.querySelector('.shopify-section');
+      const existSec = document.getElementById('shopify-section-' + sectionId)
+                    || document.querySelector('.' + sectionId);
+      if (newSec && existSec) {
+        existSec.innerHTML = newSec.innerHTML;
+        console.log('[El] Section updated:', sectionId);
+      }
+    }
+  }
+
+  /** Execute a cart action via Shopify AJAX API with bundled section rendering. */
+  async function executeCartSignal(signal) {
+    try {
+      let r;
+      const bundleOpts = {
+        sections: CART_SECTIONS,
+        sections_url: window.location.pathname,  // required for correct section context
+      };
+
+      if (signal.type === 'add') {
+        r = await fetch('/cart/add.js', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            items: [{ id: parseInt(signal.variantId, 10), quantity: signal.qty }],
+            ...bundleOpts,
+          }),
+        });
+      } else if (signal.type === 'update') {
+        r = await fetch('/cart/update.js', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            updates: { [signal.variantId]: signal.qty },
+            ...bundleOpts,
+          }),
+        });
+      } else if (signal.type === 'show_product') {
+        console.log('[El] show_product action received:', signal.title, signal.imageUrl);
+        showProductCard(signal);
+        return;
+      } else { return; }
+
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        console.error('[El] Cart AJAX error:', err);
+        addMessage('⚠️ Could not update the cart (' + (err.description || r.status) + '). Please try manually.', 'ai');
+        return;
+      }
+
+      const result = await r.json().catch(() => ({}));
+      console.log('[El] Cart AJAX ok:', signal.type, 'qty=' + signal.qty,
+        '| sections returned:', Object.keys(result.sections || {}).join(', ') || 'NONE');
+
+      // Inject the bundled section HTML returned in the same response
+      injectCartSections(result.sections);
+
+      // Push live cart state to server so El's get_cart tool stays accurate
+      try {
+        const cartRes = await fetch('/cart.js');
+        const cartData = await cartRes.json();
+        const items = (cartData.items || []).map(i => ({
+          variant_id: String(i.variant_id),
+          title: i.product_title || i.title,
+          quantity: i.quantity,
+          price: '$' + (i.price / 100).toFixed(2),
+        }));
+        fetch(BACKEND_URL + '/api/cart-state?channel=' + encodeURIComponent(AGORA_CHANNEL), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+          body: JSON.stringify({ items }),
+        }).catch(() => {});
+      } catch (_) {}
+
+    } catch (err) {
+      console.error('[El] executeCartSignal exception:', err);
+    }
+  }
+
+
+  /* ═══════════════════════════════════════════════════════
+     PRODUCT CARD
+     Embeds product image + info inside the last El bubble.
+     If no El bubble exists yet (image arrived before El speaks),
+     stores it in pendingProduct and flushAiBuffer injects it.
+     ═══════════════════════════════════════════════════════ */
+  let pendingProduct = null;   // holds { imageUrl, imageAlt, title, price } until next El bubble
+
+  function embedProductInBubble(bubble, p) {
+    if (!p.imageUrl) return;
+    // Remove any existing product embed in this bubble (don't duplicate)
+    bubble.querySelectorAll('.el-product-embed').forEach(el => el.remove());
+    const wrap = document.createElement('div');
+    wrap.className = 'el-product-embed';
+    const img = document.createElement('img');
+    img.src = p.imageUrl;
+    img.alt = p.imageAlt || p.title || '';
+    wrap.appendChild(img);
+    if (p.title || p.price) {
+      const info = document.createElement('div');
+      info.className = 'el-product-embed-info';
+      if (p.title) info.innerHTML += '<span class="el-product-embed-title">' + p.title + '</span>';
+      if (p.price) info.innerHTML += '<span class="el-product-embed-price">' + p.price + '</span>';
+      wrap.appendChild(info);
+    }
+    bubble.appendChild(wrap);
+    scrollEnd();
+  }
+
+  function showProductCard(p) {
+    if (!p.imageUrl) return;
+    // Always queue for the NEXT El bubble — never attach to a previous message.
+    // flushAiBuffer() will inject it when El's response is committed.
+    pendingProduct = p;
+    console.log('[El img] queued as pendingProduct for next El bubble:', p.title);
+  }
+
+  async function fetchProductImage(text) {
+    const candidates = new Set();
+
+    // ── Pattern 1: "added N x <Title> at $X" ──
+    const mAdded = text.match(/added\s+\d+\s+x\s+(.+?)\s+at\s+\$/i);
+    if (mAdded && mAdded[1]) candidates.add(mAdded[1].trim());
+
+    // ── Pattern 2: "<Title> at $X" or "<Title> priced at $X" ──
+    // Strip noise words after the name (e.g. "priced") before "at $"
+    const rxPrice = /([A-Za-z][A-Za-z0-9:'´\-\s]{3,60}?)(?:\s+priced)?\s+at\s+\$[\d,.]+/gi;
+    let m;
+    while ((m = rxPrice.exec(text)) !== null) {
+      const t = m[1].trim().replace(/\s+(priced|for|each)$/i, '').trim();
+      if (t.length > 3) candidates.add(t);
+    }
+
+    // ── Pattern 3: "image of the <Title>" / "image of <Title>" ──
+    const mImg = text.match(/image\s+of\s+(?:the\s+|a\s+)?([A-Za-z][A-Za-z0-9:'´\-\s]{3,60}?)(?:[.!?,]|$)/i);
+    if (mImg && mImg[1]) candidates.add(mImg[1].trim());
+
+    // ── Pattern 4: "showing you (the) <Title>" ──
+    const mShow = text.match(/showing\s+(?:you\s+)?(?:the\s+)?([A-Za-z][A-Za-z0-9:'´\-\s]{3,60}?)(?:[.!?,]|$)/i);
+    if (mShow && mShow[1]) candidates.add(mShow[1].trim());
+
+    // ── Pattern 5: "found the <Title>" / "found a <Title>" ──
+    const mFound = text.match(/found\s+(?:the\s+|a\s+)?([A-Za-z][A-Za-z0-9:'´\-\s]{3,60}?)(?:\s+priced|\s+at\s+\$|[.!?,]|$)/i);
+    if (mFound && mFound[1]) {
+      const t = mFound[1].trim();
+      if (t.length > 3) candidates.add(t);
+    }
+
+    console.log('[El img] candidates:', [...candidates], '| from:', text.slice(0, 80));
+
+    for (const title of candidates) {
+      try {
+        const r = await fetch(
+          BACKEND_URL + '/api/product-image?q=' + encodeURIComponent(title),
+          { headers: { 'ngrok-skip-browser-warning': 'true' } }
+        );
+        const d = await r.json();
+        console.log('[El img] result for "' + title + '":', d.found, d.imageUrl || '');
+        if (d.found && d.imageUrl) { showProductCard(d); return; }
+      } catch (_) {}
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     CHECKOUT BUTTON
+     ═══════════════════════════════════════════════════════ */
+  function showCheckoutButton(url) {
+    const old = msgArea.querySelector('.el-checkout-wrap');
+    if (old) old.remove();
+    const wrap = document.createElement('div');
+    wrap.className = 'el-checkout-wrap';
+    const btn = document.createElement('a');
+    btn.href = url; btn.target = '_blank'; btn.rel = 'noopener noreferrer';
+    btn.className = 'el-checkout-btn';
+    btn.innerHTML = '🛒&nbsp;&nbsp;Proceed to Checkout →';
+    wrap.appendChild(btn);
+    msgArea.appendChild(wrap);
+    scrollEnd();
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     CREATE A MESSAGE ROW  (label + bubble)
+     ═══════════════════════════════════════════════════════ */
+  function createRow(text, sender) {
+    const row = document.createElement('div');
+    row.className = 'el-msg-row ' + (sender === 'user' ? 'el-row-user' : 'el-row-ai');
+
+    const lbl = document.createElement('span');
+    lbl.className = 'el-sender-lbl';
+    lbl.textContent = sender === 'user' ? 'You' : 'El';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'el-msg-bubble ' + (sender === 'user' ? 'el-msg-user' : 'el-msg-ai');
+    bubble.innerText = cleanText(text) || text;
+
+    row.appendChild(lbl);
+    row.appendChild(bubble);
+    return { row, bubble };
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     BUFFER / FLUSH  –  AI message handling
+     bufferAiText() : called for every incoming AI stream packet
+     flushAiBuffer() : commits the fully-formed message to the chat
+     ═══════════════════════════════════════════════════════ */
+  function flushAiBuffer() {
+    clearTimeout(aiFlushTmr);
+    aiFlushTmr = null;
+    const text = aiBuffer;
+    aiBuffer = '';
+    if (aiTypingRow) { aiTypingRow.remove(); aiTypingRow = null; }
+    if (!text || text.length < 2) return;
+    if (isDup(text)) return;
+    const { row, bubble } = createRow(text, 'ai');
+    msgArea.appendChild(row);
+    // Apply any pending product image embed to this new bubble
+    if (pendingProduct) {
+      embedProductInBubble(bubble, pendingProduct);
+      pendingProduct = null;
+    }
+    scrollEnd();
+    handleAiExtras(text);
+  }
+
+  function bufferAiText(text) {
+    // Always keep the longest / latest text (Agora sends full accumulated text)
+    if (text.length >= aiBuffer.length) aiBuffer = text;
+
+    // Show a typing indicator while buffering (create once, keep until flush)
+    if (!aiTypingRow) {
+      aiTypingRow = document.createElement('div');
+      aiTypingRow.className = 'el-msg-row el-row-ai';
+      aiTypingRow.innerHTML =
+        '<span class="el-sender-lbl">El</span>' +
+        '<div class="el-msg-bubble el-msg-ai" style="opacity:0.45;font-style:italic;">El is typing…</div>';
+      msgArea.appendChild(aiTypingRow);
+      scrollEnd();
+    }
+
+    // Reset flush countdown
+    clearTimeout(aiFlushTmr);
+    aiFlushTmr = setTimeout(flushAiBuffer, AI_FLUSH_DELAY);
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     ADD MESSAGE  –  core logic
+     AI messages  → buffered until stream settles
+     User messages → shown immediately
+     ═══════════════════════════════════════════════════════ */
+  function addMessage(text, sender) {
+    if (!text || text.length < 2) return;
+
+    if (sender === 'ai') {
+      bufferAiText(text);
+      return;
+    }
+
+    // User message: flush any pending AI buffer first so the order is correct
+    flushAiBuffer();
+
+    if (/checkout|check out|buy now|place order|proceed|pay/i.test(text))
+      userWantsCheckout = true;
+
+    if (isDup(text)) return;
+
+    const { row } = createRow(text, 'user');
+    msgArea.appendChild(row);
+    scrollEnd();
+  }
+
+  function handleAiExtras(text) {
+    // ── Product image token [PRODUCT_IMG:url|title|price] ──
+    // Injected by server into search_catalog results. Extract before cleanText strips it.
+    const imgData = extractProductImgToken(text);
+    if (imgData) {
+      console.log('[El img] token found:', imgData.title, imgData.imageUrl);
+      showProductCard(imgData);
+    }
+    // Note: fetchProductImage fallback removed — product cards now come exclusively
+    // via the show_product polling action queued by search_catalog on the server.
+    // This prevents the card from being replaced by regex-guessing on El's text.
+
+    // Checkout button (only if user explicitly asked)
+    const url = extractCheckout(text);
+    if (url && userWantsCheckout) {
+      showCheckoutButton(url);
+      userWantsCheckout = false;
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     STREAM-MESSAGE PARSER
+     Format: <header>|<base64-JSON>
+     Handles:
+       • User ASR  → right-aligned bubble
+       • El speech → left-aligned bubble (buffered)
+       • image_url / product_image fields → inline product card
+     ═══════════════════════════════════════════════════════ */
+  function handleStreamMessage(uid, data) {
+    try {
+      const raw = new TextDecoder().decode(data);
+      const b64 = raw.split('|').pop();
+      let decoded;
+      try { decoded = atob(b64); } catch (e) { return; }
+
+      // VISIBLE log – open DevTools Console to see every packet and tune detection
+      console.log('[El pkt] uid=' + uid + ' | ' + decoded.slice(0, 300));
+
+      // ── Product card: El's backend can embed image_url + title + price ──
+      const imgMatch = decoded.match(/"(?:image_url|product_image|imageUrl)"\s*:\s*"(https?:[^"]+)"/);
+      if (imgMatch) {
+        const imageUrl  = imgMatch[1];
+        const titleMatch = decoded.match(/"(?:title|product_title|name)"\s*:\s*"((?:[^"\\]|\\.)*)"/); 
+        const priceMatch = decoded.match(/"(?:price|product_price)"\s*:\s*"((?:[^"\\]|\\.)*)"/); 
+        showProductCard({
+          imageUrl,
+          title : titleMatch ? titleMatch[1] : '',
+          price : priceMatch ? priceMatch[1] : '',
+        });
+      }
+
+      // Drop partial (non-final) transcription chunks
+      if (/"(?:is_final|isFinal|final|end)"\s*:\s*false/i.test(decoded)) return;
+
+      // Extract text from "text", "content", or nested delta.content
+      let text = '';
+      const mDirect = decoded.match(/"(?:text|content)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      if (mDirect && mDirect[1]) text = mDirect[1];
+      if (!text) {
+        const mDelta = decoded.match(/"delta"\s*:\s*\{[^}]*"content"\s*:\s*"((?:[^"\\]|\\.)*)"/); 
+        if (mDelta && mDelta[1]) text = mDelta[1];
+      }
+      if (!text) return;
+
+      text = text
+        .replace(/\\n/g, ' ').replace(/\\t/g, ' ')
+        .replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+        // Decode unicode escapes: \u2014 → —  (regex-extracted strings aren't JSON.parse'd)
+        .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+        .trim();
+      if (!text || text.length < 2) return;
+
+      // ── Determine sender ─────────────────────────────────
+      // Agora CA v2 stamps user UID and/or ASR object type in transcription packets.
+      // Check the console logs above to see the exact format your pipeline uses.
+      const isUser =
+        // Numeric UID match: "uid": 123  (number, no quotes)
+        /"uid"\s*:\s*123[,}\s]/.test(decoded) ||
+        // String UID match: "uid": "123"
+        /"uid"\s*:\s*"123"/.test(decoded) ||
+        // ASR object type
+        /"object"\s*:\s*"(?:asr|sentence|words|transcription)[._"/]/.test(decoded) ||
+        // data_type field
+        /"data_type"\s*:\s*"(?:transcribe|asr|user)"/i.test(decoded) ||
+        // stream_type field
+        /"stream_type"\s*:\s*"(?:asr|user|transcription)"/i.test(decoded) ||
+        // source / role / type field
+        /"(?:source|role|type)"\s*:\s*"(?:user|human|asr|self)"/i.test(decoded);
+
+      console.log('[El msg] isUser=' + isUser + ' text="' + text.slice(0, 60) + '"');
+      addMessage(text, isUser ? 'user' : 'ai');
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     START / STOP
+     ═══════════════════════════════════════════════════════ */
+  async function startEl() {
+    isActive = true;
+    elBtn.classList.add('el-active');
+    micIcon.style.display = 'none';
+    stopIcon.style.display = 'block';
+    setStatus('Connecting…', false);
+
+    msgArea.innerHTML = '';
+    seenMsgs.clear();
+    resetAiBuffer();
+    userWantsCheckout = false;
+    // Show "Waking up" directly (bypass buffer – it's a synthetic UI message)
+    const { row: wakeRow } = createRow('Waking up El…', 'ai');
+    msgArea.appendChild(wakeRow);
+    scrollEnd();
+
+    try {
+      client.on('stream-message', handleStreamMessage);
+      client.on('user-published', async (user, mediaType) => {
+        if (mediaType === 'audio') {
+          await client.subscribe(user, mediaType);
+          user.audioTrack.play();
+          micStrip.classList.add('el-listening');
+          setStatus('El is listening', true);
+        }
+      });
+      client.on('user-unpublished', (_u, mediaType) => {
+        if (mediaType === 'audio') {
+          micStrip.classList.remove('el-listening');
+          setStatus('Connected', true);
+        }
+      });
+
+      await client.join(AGORA_APP_ID, AGORA_CHANNEL, AGORA_TOKEN, BROWSER_UID);
+      localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+      await client.publish([localAudioTrack]);
+
+      const resp = await fetch(BACKEND_URL + '/api/start-el', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true',   // bypass ngrok CORS intercept
+        },
+        body: JSON.stringify({ channel: AGORA_CHANNEL }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        activeAgentId = data.agent_id || null;
+        setStatus('Connected', true);
+        startCartPolling();   // begin polling for cart actions
+      } else {
+        setStatus('Error', false);
+        addMessage('El could not start. Please try again.', 'ai');
+      }
+
+    } catch (err) {
+      console.error('[El] startEl:', err);
+      addMessage('Connection failed. Check that ngrok is running.', 'ai');
+      setStatus('Failed', false);
+    }
+  }
+
+  async function stopEl() {
+    isActive = false;
+    elBtn.classList.remove('el-active');
+    micIcon.style.display  = 'block';
+    stopIcon.style.display = 'none';
+    micStrip.classList.remove('el-listening');
+    setStatus('Disconnected', false);
+    stopCartPolling();
+    resetAiBuffer();
+
+    // Tell server to stop the Agora agent (prevents multiple agents stacking up)
+    try {
+      await fetch(BACKEND_URL + '/api/stop-el', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true',
+        },
+        body: JSON.stringify({ channel: AGORA_CHANNEL, agent_id: activeAgentId }),
+      });
+    } catch (_) { /* server unreachable – agent will idle-timeout naturally */ }
+    activeAgentId = null;
+
+    if (localAudioTrack) {
+      localAudioTrack.stop();
+      localAudioTrack.close();
+      localAudioTrack = null;
+    }
+    client.removeAllListeners();
+    try { await client.leave(); } catch (_) {}
+
+    seenMsgs.clear();
+    chatBox.classList.remove('el-open');
+    setTimeout(() => { chatBox.style.display = 'none'; }, 280);
+  }
+
+  /* ═══════════════════════════════════════════════════════
+     BUTTON CLICK
+     ═══════════════════════════════════════════════════════ */
+  elBtn.addEventListener('click', async () => {
+    if (!isActive) {
+      chatBox.style.display = 'flex';
+      requestAnimationFrame(() => chatBox.classList.add('el-open'));
+      await startEl();
+    } else {
+      await stopEl();
+    }
+  });
+
+});
+</script>

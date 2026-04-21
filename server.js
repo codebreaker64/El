@@ -12,7 +12,43 @@ const axios = require('axios');
 
 const app = express();
 
-// 1. Enable CORS for all origins
+// ── Active agent tracker (keyed by channel) ─────────────────
+// Maps channel → agent_id so we can stop the old agent before starting a new one.
+const activeAgents = new Map();
+
+async function stopAgent(channel) {
+  const agentId = activeAgents.get(channel);
+  if (!agentId) return;
+  try {
+    await axios.post(
+      `https://api.agora.io/api/conversational-ai-agent/v2/projects/${AGORA_APP_ID}/agents/${agentId}/leave`,
+      {},
+      { headers: { Authorization: `Basic ${AGORA_AUTH}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`⏹️  Stopped agent ${agentId} on channel "${channel}"`);
+  } catch (err) {
+    // Ignore – agent may have already stopped on its own
+    console.warn(`⚠️  Could not stop agent ${agentId}:`, err.response?.data?.message || err.message);
+  }
+  activeAgents.delete(channel);
+}
+
+// ── Per-channel pending cart actions (polled by widget) ──────
+// The LLM reformulates MCP tool responses, so [CART_ADD:...] tokens never
+// reliably reach the widget via RTM. Instead we queue actions here and let
+// the widget poll GET /api/cart-actions to drain them.
+const pendingActions = new Map();          // channel → Action[]
+function getPending(channel) {
+  if (!pendingActions.has(channel)) pendingActions.set(channel, []);
+  return pendingActions.get(channel);
+}
+
+// Browser pushes live cart state here after each AJAX cart operation.
+// El's get_cart tool reads from this instead of a shadow map.
+const cartStates = new Map();              // channel → CartItem[]
+
+// 1. Enable CORS for all origins (with explicit pre-flight handling)
+app.options('*', cors());   // respond to OPTIONS preflight for every route
 app.use(cors());
 
 // 2. Keep your ngrok bypass header
@@ -57,7 +93,10 @@ app.post('/api/start-el', async (req, res) => {
   const channel = req.body?.channel || 'echo-mart-dev';
   const remoteUid = '123';   // must match uid in Liquid code
 
-  console.log(`\n🟢  /api/start-el  channel="${channel}"  remoteUid="${remoteUid}"`);
+  // Stop any existing agent on this channel first (prevents agent stacking)
+  await stopAgent(channel);
+  console.log(`\n🟢  /api/start-el  channel="${channel}"  remoteUid="${remoteUid}"  (previous agent stopped)`);
+  // Note: shadow cart intentionally persists across sessions so El remembers added items.
 
   // ── Agora v2.5 Join payload ───────────────────────────────
   // Mirrors your curl exactly. pipeline_id pulls the saved agent config
@@ -69,7 +108,7 @@ app.post('/api/start-el', async (req, res) => {
     properties: {
       channel,
       token: AGORA_RTC_TOKEN,
-      agent_rtc_uid: '715636',
+      agent_rtc_uid: '999',          // must match the UID the AGORA_RTC_TOKEN was generated for
       remote_rtc_uids: [remoteUid],
       enable_string_uid: false,
       idle_timeout: 120,
@@ -79,7 +118,7 @@ app.post('/api/start-el', async (req, res) => {
         params: {
           url: 'wss://api.deepgram.com/v1/listen',
           model: 'nova-3',
-          keyterm: '',
+          keyterm: 'snowboard, ski wax, multi-location, multi-managed',
           language: 'en',
         },
       },
@@ -104,7 +143,12 @@ app.post('/api/start-el', async (req, res) => {
             '## 3. Tasks & Logic',
             '- SEARCH: Always use the \'search_catalog\' tool to find products. Never hallucinate prices or availability.',
             '- RECOMMEND: If a user is unsure, suggest 2 items and mention their key benefits.',
-            '- CART: When a user says "buy" or "add to cart," use the \'create_cart\' tool and tell them: "I\'ve added that to your cart. You can see the link on your screen now."',
+            '- CART – Add: When a user says "buy" or "add to cart," call \'create_cart\'. The item will be added to the shopper\'s Shopify cart automatically.',
+            '- CART – View: If a user asks "what is in my cart" or "show my cart," call \'get_cart\'.',
+            '- CART – Update quantity: If a user says "change the quantity" or "update", call \'update_cart_item\' with the variant_id (from get_cart) and the new quantity.',
+            '- CART – Remove: If a user says "remove" or "delete from cart", call \'remove_from_cart\' with the variant_id (from get_cart).',
+            '- After any cart action, confirm with ONE very short sentence (e.g., "Done! Added to your cart."). Never mention technical IDs, tokens, or URLs to the user.',
+            '- IMAGES: Product images are shown automatically in the chat. NEVER say you cannot show images. If asked about appearance, just describe the product briefly.',
             '- ORDERS: For tracking, ask for their Order ID and verify it using the \'get_order_status\' tool.',
             '',
             '## 4. Guardrails',
@@ -122,7 +166,7 @@ app.post('/api/start-el', async (req, res) => {
           name: 'echomart-catalog',
           transport: 'streamable_http',
           endpoint: `${NGROK_URL}/api/shopify-search`,
-          allowed_tools: ['search_catalog'],
+          allowed_tools: ['search_catalog', 'create_cart', 'get_cart', 'update_cart_item', 'remove_from_cart'],
         }],
       },
 
@@ -142,15 +186,18 @@ app.post('/api/start-el', async (req, res) => {
         sample_urls: {},
       },
 
+      turn_detection: null,   // use Agora Studio default
+
+      // Explicitly override any pipeline-level silence_config so El never
+      // sends an "are you still there?" prompt during silence.
+      // action:'think' with empty content = LLM gets no prompt, stays silent.
       parameters: {
         silence_config: {
           action: 'think',
-          content: 'politely ask if the user is still online',
-          timeout_ms: 10000,
+          content: '',
+          timeout_ms: 300000,   // 5 minutes — effectively disabled
         },
       },
-
-      turn_detection: null,   // use Agora Studio default
 
       advanced_features: {
         enable_rtm: true,
@@ -173,6 +220,8 @@ app.post('/api/start-el', async (req, res) => {
     );
 
     console.log('✅  Agora agent started:', response.data);
+    // Track this agent so we can stop it later
+    activeAgents.set(channel, response.data.agent_id);
     res.json(response.data);
 
   } catch (err) {
@@ -180,6 +229,16 @@ app.post('/api/start-el', async (req, res) => {
     console.error('❌  Agora error:', JSON.stringify(detail, null, 2));
     res.status(500).json({ error: 'Failed to start El', detail });
   }
+});
+
+// ============================================================
+//  ENDPOINT: /api/stop-el
+//  Called by the widget when the user clicks Stop.
+// ============================================================
+app.post('/api/stop-el', async (req, res) => {
+  const channel = req.body?.channel || 'echo-mart-dev';
+  await stopAgent(channel);
+  res.json({ ok: true });
 });
 
 // ============================================================
@@ -232,14 +291,51 @@ app.post('/api/shopify-search', async (req, res) => {
           },
           {
             name: 'create_cart',
-            description: 'Add a product to the shopping cart and return a checkout URL.',
+            description: 'Add a product to the shopper\'s cart. Looks up the product, then signals the browser to add it via the Shopify AJAX API so the theme cart updates in real time.',
             inputSchema: {
               type: 'object',
               properties: {
                 product_title: { type: 'string', description: 'The product title to add to cart' },
                 quantity: { type: 'number', description: 'How many to add (default: 1)' },
+                channel: { type: 'string', description: 'Session channel name (default: echo-mart-dev)' },
               },
               required: ['product_title'],
+            },
+          },
+          {
+            name: 'get_cart',
+            description: 'List the current contents of the shopper\'s cart.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                channel: { type: 'string', description: 'Session channel name (default: echo-mart-dev)' },
+              },
+              required: [],
+            },
+          },
+          {
+            name: 'update_cart_item',
+            description: 'Update the quantity of a product already in the cart.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                variant_id: { type: 'string', description: 'The numeric Shopify variant ID (returned by get_cart)' },
+                quantity: { type: 'number', description: 'New quantity (set to 0 to remove)' },
+                channel: { type: 'string', description: 'Session channel name (default: echo-mart-dev)' },
+              },
+              required: ['variant_id', 'quantity'],
+            },
+          },
+          {
+            name: 'remove_from_cart',
+            description: 'Remove a product from the cart entirely.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                variant_id: { type: 'string', description: 'The numeric Shopify variant ID to remove (from get_cart)' },
+                channel: { type: 'string', description: 'Session channel name (default: echo-mart-dev)' },
+              },
+              required: ['variant_id'],
             },
           },
         ],
@@ -257,17 +353,17 @@ app.post('/api/shopify-search', async (req, res) => {
     }
 
     const isExpensive = /expensive|most expensive|priciest|highest price/i.test(query);
-  const isCheapest = /cheap|cheapest|lowest price|affordable|budget/i.test(query);
-  const sortKey = (isExpensive || isCheapest) ? 'PRICE' : 'RELEVANCE';
-  const reverse = isExpensive;   // true = most expensive first
+    const isCheapest = /cheap|cheapest|lowest price|affordable|budget/i.test(query);
+    const sortKey = (isExpensive || isCheapest) ? 'PRICE' : 'RELEVANCE';
+    const reverse = isExpensive;   // true = most expensive first
 
-  // Strip price adjectives so Shopify searches by product type
-  const searchTerm = query
-    .replace(/most expensive|expensive|priciest|highest price|cheapest|cheap|lowest price|affordable|budget/gi, '')
-    .trim();
+    // Strip price adjectives so Shopify searches by product type
+    const searchTerm = query
+      .replace(/most expensive|expensive|priciest|highest price|cheapest|cheap|lowest price|affordable|budget/gi, '')
+      .trim();
 
-  const gql = {
-    query: `{
+    const gql = {
+      query: `{
         products(
           first: 5,
           sortKey: ${sortKey},
@@ -276,6 +372,7 @@ app.post('/api/shopify-search', async (req, res) => {
           nodes {
             title
             handle
+            featuredImage { url altText }
             variants(first: 1) {
               nodes {
                 id
@@ -285,53 +382,76 @@ app.post('/api/shopify-search', async (req, res) => {
           }
         }
       }`,
-  };
+    };
 
-  try {
-    const sfRes = await axios.post(
-      `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
-      gql,
-      { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
-    );
+    try {
+      const sfRes = await axios.post(
+        `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
+        gql,
+        { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
+      );
 
-    if (sfRes.data?.errors) {
-      console.error('❌  Storefront API errors:', JSON.stringify(sfRes.data.errors, null, 2));
-      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'The store is unavailable right now. Please try again.' }] } });
-    }
+      if (sfRes.data?.errors) {
+        console.error('❌  Storefront API errors:', JSON.stringify(sfRes.data.errors, null, 2));
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'The store is unavailable right now. Please try again.' }] } });
+      }
 
-    const top = (sfRes.data?.data?.products?.nodes || [])
-      .filter(p => p.title)
-      .slice(0, 3)
-      .map(p => {
+      const nodes = (sfRes.data?.data?.products?.nodes || []).filter(p => p.title).slice(0, 3);
+
+      const lines = nodes.map(p => {
         const price = p.variants?.nodes?.[0]?.price;
         const priceStr = price ? `$${parseFloat(price.amount).toFixed(2)} ${price.currencyCode}` : 'price unavailable';
         return `${p.title} at ${priceStr}`;
       });
 
-    const text = top.length
-      ? top.join('; ')
-      : 'No matching products found. Try searching for snowboard or wax.';
+      // Embed image token for the top result — widget strips it from bubble but renders a product card
+      // Format: [PRODUCT_IMG:imageUrl|title|price]
+      let imgToken = '';
+      const topNode = nodes[0];
+      if (topNode?.featuredImage?.url) {
+        const price = topNode.variants?.nodes?.[0]?.price;
+        const priceStr = price ? `$${parseFloat(price.amount).toFixed(2)} ${price.currencyCode}` : '';
+        imgToken = ` [PRODUCT_IMG:${topNode.featuredImage.url}|${topNode.title}|${priceStr}]`;
+        console.log('🖼️  Image token attached:', topNode.title);
 
-    console.log('✅  Shopify result:', text);
-    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+        // Also queue a show_product action so the widget shows the card via polling
+        // (LLM reformulates tool text so the token never reaches the widget via stream-message)
+        const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
+        getPending(channel).push({
+          type: 'show_product',
+          imageUrl: topNode.featuredImage.url,
+          imageAlt: topNode.featuredImage.altText || topNode.title,
+          title: topNode.title,
+          price: priceStr,
+        });
+        console.log('📦  show_product queued for channel:', channel);
+      }
 
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error('❌  Shopify error:', JSON.stringify(detail, null, 2));
-    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I had trouble searching the store. Please try again.' }] } });
-  }
+      const text = (lines.length
+        ? lines.join('; ')
+        : 'No matching products found. Try searching for snowboard or wax.') + imgToken;
+
+      console.log('✅  Shopify result:', text);
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      console.error('❌  Shopify error:', JSON.stringify(detail, null, 2));
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I had trouble searching the store. Please try again.' }] } });
+    }
   } // end search_catalog
 
-  // ── MCP: create_cart ───────────────────────────────────
+  // ── MCP: create_cart – signals widget to call AJAX /cart/add.js ────────
   if (method === 'tools/call' && params && params.name === 'create_cart') {
     const productTitle = (params.arguments && params.arguments.product_title) || '';
     const quantity = parseInt((params.arguments && params.arguments.quantity) || 1, 10) || 1;
-    console.log('[cart] product="' + productTitle + '" qty=' + quantity);
+    const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
+    console.log('[cart:add] product="' + productTitle + '" qty=' + quantity + ' channel=' + channel);
 
     try {
-      // Step 1: Find the product variant GID via Storefront API
+      // Look up the variant GID + numeric ID via Storefront API (read-only, just for metadata)
       const searchGql = {
-        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\"') + '") { nodes { title handle variants(first: 1) { nodes { id price { amount currencyCode } } } } } }',
+        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\\"') + '") { nodes { title handle variants(first: 1) { nodes { id price { amount currencyCode } } } } } }',
       };
       const searchRes = await axios.post(
         'https://' + SHOPIFY_DOMAIN + '/api/2025-04/graphql.json',
@@ -339,58 +459,93 @@ app.post('/api/shopify-search', async (req, res) => {
         { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
       );
 
-      const product = searchRes.data && searchRes.data.data && searchRes.data.data.products && searchRes.data.data.products.nodes && searchRes.data.data.products.nodes[0];
+      const product = searchRes.data?.data?.products?.nodes?.[0];
       if (!product) {
         return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I could not find "' + productTitle + '" in the store. Please try the exact product name.' }] } });
       }
 
-      const variantNode = product.variants && product.variants.nodes && product.variants.nodes[0];
-      const variantGid = variantNode && variantNode.id;
+      const variantNode = product.variants?.nodes?.[0];
+      const variantGid = variantNode?.id; // gid://shopify/ProductVariant/12345
       if (!variantGid) {
         return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: product.title + ' has no purchasable variant right now.' }] } });
       }
 
-      // Step 2: cartCreate mutation (Storefront API)
-      const cartGql = {
-        query: 'mutation cartCreate($input: CartInput!) { cartCreate(input: $input) { cart { id checkoutUrl cost { totalAmount { amount currencyCode } } } userErrors { field message } } }',
-        variables: { input: { lines: [{ quantity: quantity, merchandiseId: variantGid }] } },
-      };
-      const cartRes = await axios.post(
-        'https://' + SHOPIFY_DOMAIN + '/api/2025-04/graphql.json',
-        cartGql,
-        { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
-      );
-
-      const userErrors = cartRes.data && cartRes.data.data && cartRes.data.data.cartCreate && cartRes.data.data.cartCreate.userErrors;
-      if (userErrors && userErrors.length) {
-        const errMsg = userErrors.map(function(e) { return e.message; }).join(', ');
-        console.error('[cart] userErrors:', errMsg);
-        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Cart error: ' + errMsg }] } });
-      }
-
-      const cart = cartRes.data && cartRes.data.data && cartRes.data.data.cartCreate && cartRes.data.data.cartCreate.cart;
-      if (!cart) {
-        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Could not create a cart right now. Please try again.' }] } });
-      }
-
-      const priceNode = variantNode && variantNode.price;
+      // Extract the numeric variant ID (AJAX API needs this, not the GID)
+      const numericVariantId = variantGid.split('/').pop();
+      const priceNode = variantNode?.price;
       const unitPrice = priceNode ? ('$' + parseFloat(priceNode.amount).toFixed(2) + ' ' + priceNode.currencyCode) : '';
-      const totalNode = cart.cost && cart.cost.totalAmount;
-      const totalPrice = totalNode ? ('$' + parseFloat(totalNode.amount).toFixed(2) + ' ' + totalNode.currencyCode) : '';
+
+      // Queue a cart action for the widget to execute via /cart/add.js
+      getPending(channel).push({ type: 'add', variantId: numericVariantId, qty: quantity });
+      console.log('[cart:add] action queued. variantId=' + numericVariantId + ' qty=' + quantity);
 
       const text = 'I have added ' + quantity + ' x ' + product.title
-        + (unitPrice ? ' at ' + unitPrice + ' each' : '')
-        + (totalPrice ? '. Your cart total is ' + totalPrice : '')
-        + '. Here is your checkout link: ' + cart.checkoutUrl;
+        + (unitPrice ? ' at ' + unitPrice + ' each' : '') + '.';
 
-      console.log('[cart] checkoutUrl:', cart.checkoutUrl);
-      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: text }] } });
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
 
     } catch (err) {
-      const detail = err.response && err.response.data ? err.response.data : err.message;
-      console.error('[cart] error:', JSON.stringify(detail, null, 2));
-      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I had trouble creating your cart. Please try again.' }] } });
+      const detail = err.response?.data || err.message;
+      console.error('[cart:add] error:', JSON.stringify(detail, null, 2));
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I had trouble adding that to your cart. Please try again.' }] } });
     }
+  }
+
+  // ── MCP: get_cart – reads cart state pushed by the browser ────
+  if (method === 'tools/call' && params && params.name === 'get_cart') {
+    const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
+    const state = cartStates.get(channel);
+    console.log('[get_cart] channel:', channel, 'state items:', state ? state.length : 0);
+
+    if (!state || state.length === 0) {
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Your cart is empty. Would you like me to find something for you?' }] } });
+    }
+
+    const items = state.map(i =>
+      `${i.quantity} x ${i.title}${i.price ? ' at ' + i.price : ''}${i.variant_id ? ' (variant_id: ' + i.variant_id + ')' : ''}`
+    );
+    const text = 'Your cart contains: ' + items.join('; ') + '. You can say "remove" or "update quantity" for any item.';
+    console.log('[get_cart] result:', text);
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+  }
+
+  // ── MCP: update_cart_item – signals widget to call AJAX /cart/update.js ─
+  if (method === 'tools/call' && params && params.name === 'update_cart_item') {
+    const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
+    const variantId = (params.arguments && params.arguments.variant_id) || '';
+    const newQty = parseInt((params.arguments && params.arguments.quantity) || 1, 10);
+
+    if (!variantId) {
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Please tell me which product to update. Try asking "what is in my cart" first.' }] } });
+    }
+    console.log('[update_cart_item] variantId:', variantId, 'qty:', newQty, 'channel:', channel);
+
+    // Queue action for widget to execute via /cart/update.js
+    getPending(channel).push({ type: 'update', variantId, qty: newQty });
+    console.log('[update_cart_item] action queued variantId=' + variantId + ' qty=' + newQty);
+
+    const text = newQty <= 0
+      ? 'Done! I removed that item from your cart.'
+      : 'Done! I updated the quantity to ' + newQty + '.';
+
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+  }
+
+  // ── MCP: remove_from_cart – signals widget to call AJAX /cart/update.js ─
+  if (method === 'tools/call' && params && params.name === 'remove_from_cart') {
+    const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
+    const variantId = (params.arguments && params.arguments.variant_id) || '';
+
+    if (!variantId) {
+      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Please tell me which product to remove. Try asking "what is in my cart" first.' }] } });
+    }
+    console.log('[remove_from_cart] variantId:', variantId, 'channel:', channel);
+
+    // Queue action for widget to execute via /cart/update.js (qty 0 = remove)
+    getPending(channel).push({ type: 'update', variantId, qty: 0 });
+    console.log('[remove_from_cart] action queued variantId=' + variantId);
+
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Done! I removed that item from your cart.' }] } });
   }
 
   res.status(400).json({
@@ -398,6 +553,78 @@ app.post('/api/shopify-search', async (req, res) => {
     error: { code: -32601, message: `Method not found: ${method}` },
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+//  GET /api/cart-actions?channel=...
+//  Widget polls this every 1.5 s. Returns queued actions and drains.
+// ─────────────────────────────────────────────────────────────
+app.get('/api/cart-actions', (req, res) => {
+  const channel = (req.query.channel || 'echo-mart-dev').trim();
+  const actions = pendingActions.get(channel) || [];
+  pendingActions.set(channel, []);   // drain
+  if (actions.length) console.log(`[cart-actions] channel="${channel}" returning ${actions.length} action(s)`);
+  res.json({ actions });
+});
+
+// ─────────────────────────────────────────────────────────────
+//  POST /api/cart-state?channel=...
+//  Widget POSTs its live Shopify cart (from /cart.js) after every
+//  add/update/remove so El's get_cart tool has accurate data.
+// ─────────────────────────────────────────────────────────────
+app.post('/api/cart-state', (req, res) => {
+  const channel = (req.query.channel || req.body?.channel || 'echo-mart-dev').trim();
+  const items = req.body?.items || [];
+  cartStates.set(channel, items);
+  console.log(`[cart-state] channel="${channel}" updated: ${items.length} item(s)`);
+  res.json({ ok: true });
+});
+// GET /api/product-image?q=<title>
+// Uses Storefront API for read-only product metadata (image, price)
+app.get('/api/product-image', async (req, res) => {
+  const query = (req.query.q || '').trim();
+  const shopifyQuery = `title:${query.replace(/"/g, '\\"')}`;
+  console.log(`[product-image] incoming q="${query}"`);
+  console.log(`[product-image] Shopify GQL query → products(query: "${shopifyQuery}")`);
+  if (!query) return res.json({ found: false });
+  try {
+    const gql = {
+      query: `{
+        products(first: 1, query: "${shopifyQuery}") {
+          nodes {
+            title
+            handle
+            featuredImage { url altText }
+            variants(first: 1) {
+              nodes { price { amount currencyCode } }
+            }
+          }
+        }
+      }`,
+    };
+    const sfRes = await axios.post(
+      `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
+      gql,
+      { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
+    );
+    const product = sfRes.data?.data?.products?.nodes?.[0];
+    if (!product) return res.json({ found: false });
+    const variant = product.variants?.nodes?.[0];
+    return res.json({
+      found: true,
+      title: product.title,
+      handle: product.handle,
+      imageUrl: product.featuredImage?.url || null,
+      imageAlt: product.featuredImage?.altText || product.title,
+      price: variant?.price
+        ? `$${parseFloat(variant.price.amount).toFixed(2)} ${variant.price.currencyCode}`
+        : null,
+    });
+  } catch (err) {
+    console.error('[product-image] error:', err.message);
+    return res.json({ found: false });
+  }
+});
+
 // ── Health check ─────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok', ngrok: NGROK_URL }));
 
