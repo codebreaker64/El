@@ -114,13 +114,9 @@ app.post('/api/start-el', async (req, res) => {
       idle_timeout: 120,
 
       asr: {
-        vendor: 'deepgram',
-        params: {
-          url: 'wss://api.deepgram.com/v1/listen',
-          model: 'nova-3',
-          keyterm: 'snowboard, ski wax, multi-location, multi-managed',
-          language: 'en',
-        },
+        params: {},
+        vendor: "ares",
+        language: "en-US"
       },
 
       llm: {
@@ -449,9 +445,9 @@ app.post('/api/shopify-search', async (req, res) => {
     console.log('[cart:add] product="' + productTitle + '" qty=' + quantity + ' channel=' + channel);
 
     try {
-      // Look up the variant GID + numeric ID via Storefront API (read-only, just for metadata)
+      // Look up the variant ID and available quantity
       const searchGql = {
-        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\\"') + '") { nodes { title handle variants(first: 1) { nodes { id price { amount currencyCode } } } } } }',
+        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\\"') + '") { nodes { title handle variants(first: 1) { nodes { id quantityAvailable price { amount currencyCode } } } } } }',
       };
       const searchRes = await axios.post(
         'https://' + SHOPIFY_DOMAIN + '/api/2025-04/graphql.json',
@@ -465,9 +461,27 @@ app.post('/api/shopify-search', async (req, res) => {
       }
 
       const variantNode = product.variants?.nodes?.[0];
-      const variantGid = variantNode?.id; // gid://shopify/ProductVariant/12345
+      const variantGid = variantNode?.id;
+      const qtyAvailable = variantNode?.quantityAvailable;
+
+      console.log('[cart:add] Variant found:', variantGid);
+      console.log('[cart:add] Quantity available from Shopify:', qtyAvailable);
+
       if (!variantGid) {
         return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: product.title + ' has no purchasable variant right now.' }] } });
+      }
+
+      // ── Inventory Check ────────────────────────────────────────────────
+      if (qtyAvailable !== null && qtyAvailable !== undefined) {
+        console.log('[cart:add] Performing inventory check for:', product.title);
+        if (qtyAvailable <= 0) {
+          console.log('[cart:add] Out of stock!');
+          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Sorry, ' + product.title + ' is currently out of stock.' }] } });
+        }
+        if (quantity > qtyAvailable) {
+          console.log('[cart:add] Insufficient stock. Available:', qtyAvailable, 'Requested:', quantity);
+          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'You asked for ' + quantity + ', but we only have ' + qtyAvailable + ' ' + product.title + ' in stock. Please let me know if you want to add the available amount.' }] } });
+        }
       }
 
       // Extract the numeric variant ID (AJAX API needs this, not the GID)
