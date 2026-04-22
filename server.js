@@ -46,6 +46,7 @@ function getPending(channel) {
 // Browser pushes live cart state here after each AJAX cart operation.
 // El's get_cart tool reads from this instead of a shadow map.
 const cartStates = new Map();              // channel → CartItem[]
+const knownSoldOut = new Set();            // variantIds that Shopify AJAX API rejected as sold out
 
 // 1. Enable CORS for all origins (with explicit pre-flight handling)
 app.options('*', cors());   // respond to OPTIONS preflight for every route
@@ -445,9 +446,9 @@ app.post('/api/shopify-search', async (req, res) => {
     console.log('[cart:add] product="' + productTitle + '" qty=' + quantity + ' channel=' + channel);
 
     try {
-      // Look up the variant ID and available quantity
+      // Look up the variant ID, available quantity, and whether it's actually for sale
       const searchGql = {
-        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\\"') + '") { nodes { title handle variants(first: 1) { nodes { id quantityAvailable price { amount currencyCode } } } } } }',
+        query: '{ products(first: 1, query: "title:' + productTitle.replace(/"/g, '\\"') + '") { nodes { title handle variants(first: 1) { nodes { id availableForSale quantityAvailable price { amount currencyCode } } } } } }',
       };
       const searchRes = await axios.post(
         'https://' + SHOPIFY_DOMAIN + '/api/2025-04/graphql.json',
@@ -463,29 +464,45 @@ app.post('/api/shopify-search', async (req, res) => {
       const variantNode = product.variants?.nodes?.[0];
       const variantGid = variantNode?.id;
       const qtyAvailable = variantNode?.quantityAvailable;
+      const availableForSale = variantNode?.availableForSale;
 
       console.log('[cart:add] Variant found:', variantGid);
-      console.log('[cart:add] Quantity available from Shopify:', qtyAvailable);
+      console.log(`[cart:add] qtyAvailable: ${qtyAvailable}, availableForSale: ${availableForSale}`);
 
       if (!variantGid) {
         return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: product.title + ' has no purchasable variant right now.' }] } });
       }
 
+      // Extract the numeric variant ID (AJAX API needs this, not the GID)
+      const numericVariantId = variantGid.split('/').pop();
+
+      if (availableForSale === false || knownSoldOut.has(String(numericVariantId))) {
+        console.log('[cart:add] Not available for sale online (or known sold out)!');
+        return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Sorry, ' + product.title + ' is currently sold out or unavailable online.' }] } });
+      }
+
+      // Check how many are ALREADY in the cart
+      const state = cartStates.get(channel) || [];
+      const existingItem = state.find(item => String(item.variant_id) === numericVariantId);
+      const existingQty = existingItem ? existingItem.quantity : 0;
+      const totalRequested = quantity + existingQty;
+
       // ── Inventory Check ────────────────────────────────────────────────
       if (qtyAvailable !== null && qtyAvailable !== undefined) {
-        console.log('[cart:add] Performing inventory check for:', product.title);
+        console.log(`[cart:add] Inventory Check -> In stock: ${qtyAvailable}, In cart: ${existingQty}, Adding: ${quantity}, Total: ${totalRequested}`);
         if (qtyAvailable <= 0) {
           console.log('[cart:add] Out of stock!');
           return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Sorry, ' + product.title + ' is currently out of stock.' }] } });
         }
-        if (quantity > qtyAvailable) {
-          console.log('[cart:add] Insufficient stock. Available:', qtyAvailable, 'Requested:', quantity);
-          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'You asked for ' + quantity + ', but we only have ' + qtyAvailable + ' ' + product.title + ' in stock. Please let me know if you want to add the available amount.' }] } });
+        if (totalRequested > qtyAvailable) {
+          console.log('[cart:add] Insufficient stock. Available:', qtyAvailable, 'Total Requested:', totalRequested);
+          if (existingQty > 0) {
+            return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'You already have ' + existingQty + ' in your cart, and we only have ' + qtyAvailable + ' in stock. You can only add ' + Math.max(0, qtyAvailable - existingQty) + ' more.' }] } });
+          } else {
+            return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'You asked for ' + quantity + ', but we only have ' + qtyAvailable + ' ' + product.title + ' in stock. Please let me know if you want to add the available amount.' }] } });
+          }
         }
       }
-
-      // Extract the numeric variant ID (AJAX API needs this, not the GID)
-      const numericVariantId = variantGid.split('/').pop();
       const priceNode = variantNode?.price;
       const unitPrice = priceNode ? ('$' + parseFloat(priceNode.amount).toFixed(2) + ' ' + priceNode.currencyCode) : '';
 
@@ -493,8 +510,7 @@ app.post('/api/shopify-search', async (req, res) => {
       getPending(channel).push({ type: 'add', variantId: numericVariantId, qty: quantity });
       console.log('[cart:add] action queued. variantId=' + numericVariantId + ' qty=' + quantity);
 
-      const text = 'I have added ' + quantity + ' x ' + product.title
-        + (unitPrice ? ' at ' + unitPrice + ' each' : '') + '.';
+      const text = 'I have signaled the store to add ' + quantity + ' x ' + product.title + ' for you. It should appear in your cart in a moment.';
 
       return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
 
@@ -532,15 +548,51 @@ app.post('/api/shopify-search', async (req, res) => {
     if (!variantId) {
       return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Please tell me which product to update. Try asking "what is in my cart" first.' }] } });
     }
-    console.log('[update_cart_item] variantId:', variantId, 'qty:', newQty, 'channel:', channel);
+
+    console.log('[update_cart_item] Checking inventory for variantId:', variantId);
+
+    // ── Inventory Check for Update ───────────────────────────────────
+    try {
+      const gql = {
+        query: `{
+          node(id: "gid://shopify/ProductVariant/${variantId}") {
+            ... on ProductVariant {
+              availableForSale
+              quantityAvailable
+              product { title }
+            }
+          }
+        }`,
+      };
+      const sfRes = await axios.post(
+        `https://${SHOPIFY_DOMAIN}/api/2025-04/graphql.json`,
+        gql,
+        { headers: { 'Content-Type': 'application/json', 'X-Shopify-Storefront-Access-Token': SHOPIFY_TOKEN } }
+      );
+
+      const variantNode = sfRes.data?.data?.node;
+      if (variantNode) {
+        const { availableForSale, quantityAvailable, product } = variantNode;
+        console.log(`[update_cart_item] stock: ${quantityAvailable}, forSale: ${availableForSale}`);
+
+        if (availableForSale === false) {
+          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Sorry, ' + product.title + ' is now sold out.' }] } });
+        }
+        if (quantityAvailable !== null && quantityAvailable !== undefined && newQty > quantityAvailable) {
+          return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I can only update that to ' + quantityAvailable + ' because that is all we have in stock.' }] } });
+        }
+      }
+    } catch (err) {
+      console.error('[update_cart_item] Inventory check failed (skipping):', err.message);
+    }
 
     // Queue action for widget to execute via /cart/update.js
     getPending(channel).push({ type: 'update', variantId, qty: newQty });
     console.log('[update_cart_item] action queued variantId=' + variantId + ' qty=' + newQty);
 
     const text = newQty <= 0
-      ? 'Done! I removed that item from your cart.'
-      : 'Done! I updated the quantity to ' + newQty + '.';
+      ? 'I have requested to remove that item from your cart.'
+      : 'I have signaled the store to update the quantity to ' + newQty + ' for you.';
 
     return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
   }
@@ -559,7 +611,7 @@ app.post('/api/shopify-search', async (req, res) => {
     getPending(channel).push({ type: 'update', variantId, qty: 0 });
     console.log('[remove_from_cart] action queued variantId=' + variantId);
 
-    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'Done! I removed that item from your cart.' }] } });
+    return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'I have signaled the store to remove that item for you.' }] } });
   }
 
   res.status(400).json({
@@ -578,6 +630,19 @@ app.get('/api/cart-actions', (req, res) => {
   pendingActions.set(channel, []);   // drain
   if (actions.length) console.log(`[cart-actions] channel="${channel}" returning ${actions.length} action(s)`);
   res.json({ actions });
+});
+
+// ─────────────────────────────────────────────────────────────
+//  POST /api/report-sold-out
+//  Called by widget when Shopify AJAX returns "sold out"
+// ─────────────────────────────────────────────────────────────
+app.post('/api/report-sold-out', (req, res) => {
+  const variantId = String(req.body?.variantId || '');
+  if (variantId) {
+    knownSoldOut.add(variantId);
+    console.log(`[sold-out] Variant ${variantId} marked as known sold out.`);
+  }
+  res.json({ ok: true });
 });
 
 // ─────────────────────────────────────────────────────────────

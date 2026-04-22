@@ -455,14 +455,19 @@ window.addEventListener('load', function () {
     try {
       let r;
       const bundleOpts = {
-        sections: CART_SECTIONS,
-        sections_url: window.location.pathname,  // required for correct section context
+        sections: Array.isArray(CART_SECTIONS) ? CART_SECTIONS.join(',') : CART_SECTIONS,
+        sections_url: window.location.pathname,
       };
+
+      console.log('[El] Executing cart signal:', signal.type, signal.variantId, 'qty:', signal.qty);
 
       if (signal.type === 'add') {
         r = await fetch('/cart/add.js', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
           body: JSON.stringify({
             items: [{ id: parseInt(signal.variantId, 10), quantity: signal.qty }],
             ...bundleOpts,
@@ -471,7 +476,10 @@ window.addEventListener('load', function () {
       } else if (signal.type === 'update') {
         r = await fetch('/cart/update.js', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
           body: JSON.stringify({
             updates: { [signal.variantId]: signal.qty },
             ...bundleOpts,
@@ -486,7 +494,17 @@ window.addEventListener('load', function () {
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
         console.error('[El] Cart AJAX error:', err);
-        addMessage('⚠️ Could not update the cart (' + (err.description || r.status) + '). Please try manually.', 'ai');
+        const errorMsg = (err.message || err.description || r.statusText || 'Error');
+        addMessage('⚠️ Could not update the cart (' + errorMsg + '). Please try manually.', 'ai');
+        
+        // Report sold out status back to server so El learns
+        if (errorMsg.toLowerCase().includes('sold out')) {
+          fetch(BACKEND_URL + '/api/report-sold-out', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+            body: JSON.stringify({ variantId: signal.variantId })
+          }).catch(() => {});
+        }
         return;
       }
 
@@ -498,25 +516,30 @@ window.addEventListener('load', function () {
       injectCartSections(result.sections);
 
       // Push live cart state to server so El's get_cart tool stays accurate
-      try {
-        const cartRes = await fetch('/cart.js');
-        const cartData = await cartRes.json();
-        const items = (cartData.items || []).map(i => ({
-          variant_id: String(i.variant_id),
-          title: i.product_title || i.title,
-          quantity: i.quantity,
-          price: '$' + (i.price / 100).toFixed(2),
-        }));
-        fetch(BACKEND_URL + '/api/cart-state?channel=' + encodeURIComponent(AGORA_CHANNEL), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
-          body: JSON.stringify({ items }),
-        }).catch(() => {});
-      } catch (_) {}
+      await syncCartState();
 
     } catch (err) {
       console.error('[El] executeCartSignal exception:', err);
     }
+  }
+
+  async function syncCartState() {
+    try {
+      const cartRes = await fetch('/cart.js');
+      const cartData = await cartRes.json();
+      const items = (cartData.items || []).map(i => ({
+        variant_id: String(i.variant_id),
+        title: i.product_title || i.title,
+        quantity: i.quantity,
+        price: '$' + (i.price / 100).toFixed(2),
+      }));
+      await fetch(BACKEND_URL + '/api/cart-state?channel=' + encodeURIComponent(AGORA_CHANNEL), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+        body: JSON.stringify({ items }),
+      });
+      console.log('[El] Cart state synced:', items.length, 'items');
+    } catch (_) {}
   }
 
 
@@ -857,6 +880,7 @@ window.addEventListener('load', function () {
         activeAgentId = data.agent_id || null;
         setStatus('Connected', true);
         startCartPolling();   // begin polling for cart actions
+        syncCartState();      // initial sync so El knows what's in the cart
       } else {
         setStatus('Error', false);
         addMessage('El could not start. Please try again.', 'ai');
