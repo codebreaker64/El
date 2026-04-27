@@ -2,6 +2,12 @@
 
 **El** is a voice-powered shopping assistant embedded directly in an EchoMart Shopify storefront. Customers simply **talk** to El and she finds products, manages their cart in real time, and answers questions, all through natural voice conversation.
 
+
+
+https://github.com/user-attachments/assets/83a8c46f-1672-4876-ad45-37eb0216d145
+
+
+
 ---
 
 ## What El Can Do
