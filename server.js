@@ -5,15 +5,17 @@
 //          ngrok http 3000
 // ============================================================
 
-require('dotenv').config({ path: '.env.local' });        // loads .env.local explicitly
+require('dotenv').config({ path: '.env.local' });
 const express = require('express');
-const cors = require('cors');    // <--- Add this
+const cors = require('cors');
 const axios = require('axios');
 
 const app = express();
 
 // ── Active agent tracker (keyed by channel) ─────────────────
-// Maps channel → agent_id so we can stop the old agent before starting a new one.
+// Maps channel name → Agora agent_id.
+// Prevents "ghost" agents if the user clicks Start twice — we always stop
+// the previous agent before spawning a new one on the same channel.
 const activeAgents = new Map();
 
 async function stopAgent(channel) {
@@ -27,32 +29,41 @@ async function stopAgent(channel) {
     );
     console.log(`⏹️  Stopped agent ${agentId} on channel "${channel}"`);
   } catch (err) {
-    // Ignore – agent may have already stopped on its own
     console.warn(`⚠️  Could not stop agent ${agentId}:`, err.response?.data?.message || err.message);
   }
   activeAgents.delete(channel);
 }
 
 // ── Per-channel pending cart actions (polled by widget) ──────
-// The LLM reformulates MCP tool responses, so [CART_ADD:...] tokens never
-// reliably reach the widget via RTM. Instead we queue actions here and let
-// the widget poll GET /api/cart-actions to drain them.
-const pendingActions = new Map();          // channel → Action[]
+// WHY POLLING INSTEAD OF RTM:
+// El's LLM rewrites MCP tool results in its own words before sending them
+// to the browser via the RTM stream. Any [CART_ADD:...] tokens embedded in
+// the original tool response are stripped/reworded and never reliably arrive.
+// Solution: server queues actions here; widget polls GET /api/cart-actions
+// every 1.5 s and executes them against the Shopify AJAX API directly.
+const pendingActions = new Map();
+
+/** Returns (and lazily creates) the action queue for a given channel. */
 function getPending(channel) {
   if (!pendingActions.has(channel)) pendingActions.set(channel, []);
   return pendingActions.get(channel);
 }
 
-// Browser pushes live cart state here after each AJAX cart operation.
-// El's get_cart tool reads from this instead of a shadow map.
-const cartStates = new Map();              // channel → CartItem[]
-const knownSoldOut = new Set();            // variantIds that Shopify AJAX API rejected as sold out
+// Live cart state pushed by the browser after every AJAX cart operation.
+// El's get_cart MCP tool reads from this map so it always reflects the
+// shopper's actual Shopify cart without needing a server-side session.
+const cartStates = new Map();
 
-// 1. Enable CORS for all origins (with explicit pre-flight handling)
-app.options('*', cors());   // respond to OPTIONS preflight for every route
+// Variant IDs that the browser has reported as "sold out" via the AJAX API.
+// create_cart checks this set to give El immediate feedback without
+// needing to re-query Shopify for every add attempt.
+const knownSoldOut = new Set();
+
+// Allow cross-origin requests — the Shopify storefront is on a different origin.
+app.options('*', cors());
 app.use(cors());
 
-// 2. Keep your ngrok bypass header
+// ngrok intercepts browser requests and shows a warning page unless this header is set.
 app.use((_req, res, next) => {
   res.setHeader('ngrok-skip-browser-warning', 'true');
   next();
@@ -67,11 +78,11 @@ const AGORA_AUTH = Buffer.from(
 ).toString('base64');
 
 const AGORA_RTC_TOKEN = process.env.AGORA_RTC_TOKEN;
-const AGORA_PIPELINE_ID = process.env.AGORA_PIPELINE_ID; // stores your Deepgram/OpenAI/MiniMax keys
+const AGORA_PIPELINE_ID = process.env.AGORA_PIPELINE_ID;
 const NGROK_URL = process.env.NGROK_URL;
 
-const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN;       // your-store.myshopify.com
-const SHOPIFY_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN; // shpat_xxxx
+const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN;
+const SHOPIFY_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;
 
 // ── Startup guard ────────────────────────────────────────────
 const REQUIRED_VARS = [
@@ -90,29 +101,32 @@ if (missing.length) {
 //  Called by the "Wake El" button in your Shopify Liquid code.
 // ============================================================
 app.post('/api/start-el', async (req, res) => {
-  // Accept optional overrides from the frontend; fall back to your Studio defaults
-  const channel = req.body?.channel || 'echo-mart-dev';
-  const remoteUid = '123';   // must match uid in Liquid code
 
-  // Stop any existing agent on this channel first (prevents agent stacking)
+  // channel — Agora RTC channel name; must match the one the browser joins.
+  // remoteUid — numeric UID the browser client uses (hardcoded to '123');
+  //             El's agent only talks to this UID.
+  const channel = req.body?.channel || 'echo-mart-dev';
+  const remoteUid = '123';
+
+  // Stop any existing agent on this channel before starting a fresh one.
+  // Without this, clicking "Start" twice would launch two simultaneous agents.
   await stopAgent(channel);
   console.log(`\n🟢  /api/start-el  channel="${channel}"  remoteUid="${remoteUid}"  (previous agent stopped)`);
-  // Note: shadow cart intentionally persists across sessions so El remembers added items.
 
-  // ── Agora v2.5 Join payload ───────────────────────────────
-  // Mirrors your curl exactly. pipeline_id pulls the saved agent config
-  // Mirrors your curl exactly.
+  // ── Agora Conversational AI agent join payload ───────────
+  // pipeline_id points to the saved Agora Studio pipeline that wires
+  // together ASR → LLM → TTS and the MCP tool configuration.
   const agoraPayload = {
-    name: `El_Assistant_${Date.now()}`,  // must be unique per-call
-    pipeline_id: AGORA_PIPELINE_ID,     // ← holds your Deepgram/OpenAI/MiniMax credentials
+    name: `El_Assistant_${Date.now()}`,  // unique name per session for tracing
+    pipeline_id: AGORA_PIPELINE_ID,
 
     properties: {
       channel,
       token: AGORA_RTC_TOKEN,
-      agent_rtc_uid: '999',          // must match the UID the AGORA_RTC_TOKEN was generated for
-      remote_rtc_uids: [remoteUid],
+      agent_rtc_uid: '999',             // El's own numeric UID in the channel
+      remote_rtc_uids: [remoteUid],     // only listen to / speak to this user
       enable_string_uid: false,
-      idle_timeout: 120,
+      idle_timeout: 120,                // auto-leave after 120 s of silence
 
       asr: {
         params: {},
@@ -156,9 +170,12 @@ app.post('/api/start-el', async (req, res) => {
         }],
         greeting_message: 'Welcome! I am El, your personal shopping assistant. How can I help you?',
 
-        // ── Tool: search_catalog ────────────────────────────────
-        // Agora calls this MCP endpoint when El invokes search_catalog.
-        // The endpoint below implements the MCP Streamable-HTTP protocol.
+        // ── MCP server config ────────────────────────────────────
+        // Agora uses the MCP Streamable-HTTP transport to call our tools.
+        // When El decides to invoke a tool, Agora sends a JSON-RPC POST
+        // to this endpoint (initialize → tools/list → tools/call sequence).
+        // allowed_tools is an allowlist so the LLM cannot call any tool
+        // that isn't explicitly listed here.
         mcp_servers: [{
           name: 'echomart-catalog',
           transport: 'streamable_http',
@@ -183,23 +200,20 @@ app.post('/api/start-el', async (req, res) => {
         sample_urls: {},
       },
 
-      turn_detection: null,   // use Agora Studio default
+      turn_detection: null,
 
-      // Explicitly override any pipeline-level silence_config so El never
-      // sends an "are you still there?" prompt during silence.
-      // action:'think' with empty content = LLM gets no prompt, stays silent.
       parameters: {
         silence_config: {
           action: 'think',
           content: '',
-          timeout_ms: 300000,   // 5 minutes — effectively disabled
+          timeout_ms: 300000,
         },
       },
 
       advanced_features: {
         enable_rtm: true,
         enable_sal: true,
-        enable_tools: true,   // required for MCP tool invocation
+        enable_tools: true,
       },
     },
   };
@@ -217,7 +231,7 @@ app.post('/api/start-el', async (req, res) => {
     );
 
     console.log('✅  Agora agent started:', response.data);
-    // Track this agent so we can stop it later
+
     activeAgents.set(channel, response.data.agent_id);
     res.json(response.data);
 
@@ -246,11 +260,9 @@ app.post('/api/stop-el', async (req, res) => {
 app.post('/api/shopify-search', async (req, res) => {
   const { method, params, id } = req.body || {};
 
-  // Log every incoming request so we can see what Agora sends
   console.log(`\n📨  MCP request → method: "${method}" id: ${id}`);
   if (params) console.log('    params:', JSON.stringify(params, null, 2));
 
-  // ── MCP: initialize handshake (Agora sends this first) ─────
   if (method === 'initialize') {
     return res.json({
       jsonrpc: '2.0',
@@ -340,7 +352,10 @@ app.post('/api/shopify-search', async (req, res) => {
     });
   }
 
-  // ── MCP: search_catalog ────────�    // ── Detect price intent — use Shopify API-level sorting ──────
+  // ── MCP: search_catalog ────────────────────────────────────
+  // Receives a free-text query from El (e.g. "most expensive snowboard").
+  // Detects price-intent keywords to set Shopify's sortKey/reverse flags,
+  // then strips those adjectives before passing the term to the GraphQL API.
   if (method === 'tools/call' && params && params.name === 'search_catalog') {
     const query = (params.arguments && params.arguments.query) || '';
     console.log('[search] query:', query);
@@ -349,12 +364,13 @@ app.post('/api/shopify-search', async (req, res) => {
       return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: "Please tell me what you're looking for." }] } });
     }
 
+    // Determine sort order based on price-intent keywords in the query
     const isExpensive = /expensive|most expensive|priciest|highest price/i.test(query);
     const isCheapest = /cheap|cheapest|lowest price|affordable|budget/i.test(query);
     const sortKey = (isExpensive || isCheapest) ? 'PRICE' : 'RELEVANCE';
-    const reverse = isExpensive;   // true = most expensive first
+    const reverse = isExpensive; // PRICE DESC = most expensive first
 
-    // Strip price adjectives so Shopify searches by product type
+    // Strip price adjectives so Shopify searches by product name/type only
     const searchTerm = query
       .replace(/most expensive|expensive|priciest|highest price|cheapest|cheap|lowest price|affordable|budget/gi, '')
       .trim();
@@ -401,8 +417,11 @@ app.post('/api/shopify-search', async (req, res) => {
         return `${p.title} at ${priceStr}`;
       });
 
-      // Embed image token for the top result — widget strips it from bubble but renders a product card
+      // Attach a PRODUCT_IMG token to the tool result text so the widget
+      // can render an inline product card in El's chat bubble.
       // Format: [PRODUCT_IMG:imageUrl|title|price]
+      // Note: the LLM strips/rewrites tool text, so we ALSO queue a
+      // show_product action via pendingActions as a reliable fallback.
       let imgToken = '';
       const topNode = nodes[0];
       if (topNode?.featuredImage?.url) {
@@ -411,8 +430,8 @@ app.post('/api/shopify-search', async (req, res) => {
         imgToken = ` [PRODUCT_IMG:${topNode.featuredImage.url}|${topNode.title}|${priceStr}]`;
         console.log('🖼️  Image token attached:', topNode.title);
 
-        // Also queue a show_product action so the widget shows the card via polling
-        // (LLM reformulates tool text so the token never reaches the widget via stream-message)
+        // Reliable fallback: queue show_product so the widget picks it up
+        // via the /api/cart-actions poll even if the token is stripped by the LLM.
         const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
         getPending(channel).push({
           type: 'show_product',
@@ -438,7 +457,13 @@ app.post('/api/shopify-search', async (req, res) => {
     }
   } // end search_catalog
 
-  // ── MCP: create_cart – signals widget to call AJAX /cart/add.js ────────
+  // ── MCP: create_cart ───────────────────────────────────────
+  // Does NOT add to cart directly — the server has no Shopify session cookie.
+  // Instead it:
+  //   1. Looks up the variant GID via Storefront GraphQL.
+  //   2. Checks inventory and the knownSoldOut set.
+  //   3. Queues an { type:'add', variantId, qty } action.
+  //   4. The widget drains the queue and calls /cart/add.js in the browser.
   if (method === 'tools/call' && params && params.name === 'create_cart') {
     const productTitle = (params.arguments && params.arguments.product_title) || '';
     const quantity = parseInt((params.arguments && params.arguments.quantity) || 1, 10) || 1;
@@ -473,7 +498,8 @@ app.post('/api/shopify-search', async (req, res) => {
         return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: product.title + ' has no purchasable variant right now.' }] } });
       }
 
-      // Extract the numeric variant ID (AJAX API needs this, not the GID)
+      // Shopify GraphQL returns Global IDs like "gid://shopify/ProductVariant/12345".
+      // The AJAX /cart/add.js endpoint requires only the trailing numeric portion.
       const numericVariantId = variantGid.split('/').pop();
 
       if (availableForSale === false || knownSoldOut.has(String(numericVariantId))) {
@@ -521,7 +547,10 @@ app.post('/api/shopify-search', async (req, res) => {
     }
   }
 
-  // ── MCP: get_cart – reads cart state pushed by the browser ────
+  // ── MCP: get_cart ──────────────────────────────────────────
+  // Reads from the in-memory cartStates map that the browser keeps up to date
+  // (via POST /api/cart-state) after every cart mutation.
+  // This avoids needing a Shopify Admin API call or a server-side session.
   if (method === 'tools/call' && params && params.name === 'get_cart') {
     const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
     const state = cartStates.get(channel);
@@ -539,7 +568,9 @@ app.post('/api/shopify-search', async (req, res) => {
     return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
   }
 
-  // ── MCP: update_cart_item – signals widget to call AJAX /cart/update.js ─
+  // ── MCP: update_cart_item ──────────────────────────────────
+  // Re-checks live inventory before queuing the update so El can warn the
+  // user if they try to increase beyond available stock.
   if (method === 'tools/call' && params && params.name === 'update_cart_item') {
     const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
     const variantId = (params.arguments && params.arguments.variant_id) || '';
@@ -597,7 +628,9 @@ app.post('/api/shopify-search', async (req, res) => {
     return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
   }
 
-  // ── MCP: remove_from_cart – signals widget to call AJAX /cart/update.js ─
+  // ── MCP: remove_from_cart ─────────────────────────────────
+  // Reuses the update mechanism: setting quantity to 0 removes the line item
+  // via /cart/update.js (Shopify AJAX API convention).
   if (method === 'tools/call' && params && params.name === 'remove_from_cart') {
     const channel = (params.arguments && params.arguments.channel) || 'echo-mart-dev';
     const variantId = (params.arguments && params.arguments.variant_id) || '';
@@ -622,19 +655,24 @@ app.post('/api/shopify-search', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  GET /api/cart-actions?channel=...
-//  Widget polls this every 1.5 s. Returns queued actions and drains.
+//  The widget polls this every 1.5 s while El is active.
+//  Returns all queued actions and atomically drains the queue so each
+//  action is executed exactly once.
 // ─────────────────────────────────────────────────────────────
 app.get('/api/cart-actions', (req, res) => {
   const channel = (req.query.channel || 'echo-mart-dev').trim();
   const actions = pendingActions.get(channel) || [];
-  pendingActions.set(channel, []);   // drain
+  pendingActions.set(channel, []);   // drain — actions consumed, queue reset
   if (actions.length) console.log(`[cart-actions] channel="${channel}" returning ${actions.length} action(s)`);
   res.json({ actions });
 });
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/report-sold-out
-//  Called by widget when Shopify AJAX returns "sold out"
+//  The browser calls this when Shopify's /cart/add.js rejects an item
+//  with a "sold out" error. The variant ID is added to knownSoldOut so
+//  El can immediately refuse future add attempts for the same item
+//  without needing to re-query Shopify.
 // ─────────────────────────────────────────────────────────────
 app.post('/api/report-sold-out', (req, res) => {
   const variantId = String(req.body?.variantId || '');
@@ -647,8 +685,10 @@ app.post('/api/report-sold-out', (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 //  POST /api/cart-state?channel=...
-//  Widget POSTs its live Shopify cart (from /cart.js) after every
-//  add/update/remove so El's get_cart tool has accurate data.
+//  The widget calls syncCartState() after every cart mutation,
+//  posting the full /cart.js item list here. El's get_cart tool reads
+//  from this map instead of making its own Shopify API call, keeping
+//  it always in sync with the real browser session cart.
 // ─────────────────────────────────────────────────────────────
 app.post('/api/cart-state', (req, res) => {
   const channel = (req.query.channel || req.body?.channel || 'echo-mart-dev').trim();
@@ -657,8 +697,12 @@ app.post('/api/cart-state', (req, res) => {
   console.log(`[cart-state] channel="${channel}" updated: ${items.length} item(s)`);
   res.json({ ok: true });
 });
-// GET /api/product-image?q=<title>
-// Uses Storefront API for read-only product metadata (image, price)
+// ─────────────────────────────────────────────────────────────
+//  GET /api/product-image?q=<title>
+//  Called by the widget when it detects a product name in El's speech
+//  (e.g. "I found The Complete Snowboard…") and wants to show an inline
+//  product card. Uses the Storefront API for read-only metadata only.
+// ─────────────────────────────────────────────────────────────
 app.get('/api/product-image', async (req, res) => {
   const query = (req.query.q || '').trim();
   const shopifyQuery = `title:${query.replace(/"/g, '\\"')}`;

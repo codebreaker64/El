@@ -1,6 +1,5 @@
 <!-- ============================================================
-  El Voice Assistant Widget  v3
-  Paste into Shopify theme.liquid before </body>
+  El Voice Assistant Widget
   ============================================================ -->
 
 <div id="el-assistant-root">
@@ -205,28 +204,30 @@
 <script src="https://download.agora.io/sdk/release/AgoraRTC_N.js" defer></script>
 
 <!-- ══════════════════════════════════════════════════════ -->
-<!--  EL LOGIC  v3                                          -->
+<!--  EL LOGIC                                              -->
 <!-- ══════════════════════════════════════════════════════ -->
 <script>
 window.addEventListener('load', function () {
 
   /* ═══════════════════════════════════════════════════════
      CONFIG  –  update AGORA_TOKEN each session
+     These three values must be refreshed whenever you rotate
+     the ngrok URL or regenerate the Agora RTC token.
      ═══════════════════════════════════════════════════════ */
-  const AGORA_APP_ID  = "43255fc9405c4e4dbeae512d2700d917";
-  const AGORA_CHANNEL = "echo-mart-dev";
-  const AGORA_TOKEN   = "007eJxTYJihnafs/FDUQ1Qm+uK30zMV7q7l5Sy3O2q3KeVA4dcgCU4FBhNjI1PTtGRLEwPTZJNUk5Sk1MRUU0OjFCNzA4MUS0PzT0XPMxsCGRnuigswMTJAIIjPy5CanJGvm5tYVKKbklrGwAAAzIAg2A==";
-  const BACKEND_URL   = "https://cartoon-banister-slain.ngrok-free.dev";
-  const BROWSER_UID   = 123;
+  const AGORA_APP_ID  = "YOUR_AGORA_APP_ID";
+  const AGORA_CHANNEL = "echo-mart-dev";  // must match server.js default channel
+  const AGORA_TOKEN   = "YOUR_AGORA_TOKEN";
+  const BACKEND_URL   = "YOUR_NGROK_URL";  // ngrok public URL — update each session
+  const BROWSER_UID   = 123;  // numeric UID this browser client uses in the Agora channel
 
   /* ═══════════════════════════════════════════════════════
      CLIENT + STATE
      ═══════════════════════════════════════════════════════ */
   const client    = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
-  let localAudioTrack = null;
-  let isActive        = false;
-  let activeAgentId   = null;   // tracks the running Agora agent_id
-  let cartPollInterval = null;  // polls /api/cart-actions
+  let localAudioTrack = null;    // microphone track published to the channel
+  let isActive        = false;   // true while El is running
+  let activeAgentId   = null;    // tracks the running Agora agent_id for cleanup
+  let cartPollInterval = null;   // setInterval handle for /api/cart-actions polling
 
   /*
    * BUFFER STATE
@@ -234,18 +235,16 @@ window.addEventListener('load', function () {
    * FULL accumulated text so far ("Sure," → "Sure, here is…").
    * We buffer silently and only commit a bubble once the stream goes quiet
    * for AI_FLUSH_DELAY ms, guaranteeing the chat shows the complete message.
+   * This prevents the user from seeing half-finished sentences flickering in.
    */
   const AI_FLUSH_DELAY = 900;   // ms of silence before committing AI message
-  let aiBuffer     = '';         // latest accumulated AI text
-  let aiFlushTmr   = null;       // timer that fires flushAiBuffer()
-  let aiTypingRow  = null;       // "El is typing…" placeholder row
+  let aiBuffer     = '';         // latest accumulated AI text from the stream
+  let aiFlushTmr   = null;       // handle for the flush debounce timer
+  let aiTypingRow  = null;       // "El is typing…" placeholder row shown while buffering
 
   /* Deduplication (guards against exact repeats) */
   const seenMsgs = new Map();
   const DEDUP_MS = 6000;
-
-  /* Checkout gate */
-  let userWantsCheckout = false;
 
   /* ── DOM ────────────────────────────────────────────── */
   const elBtn     = document.getElementById('el-button');
@@ -289,9 +288,14 @@ window.addEventListener('load', function () {
      The widget polls GET /api/cart-actions every 1.5 s while El is active.
      The server queues actions when the MCP tool is invoked, and the widget
      drains the queue and executes them via the Shopify AJAX API.
+
+     WHY POLL INSTEAD OF LISTENING ON RTM:
+     El's LLM rewrites MCP tool results in natural language before they reach
+     the RTM stream, stripping any embedded action tokens. Polling is the
+     only reliable delivery mechanism for server-queued cart signals.
      ═══════════════════════════════════════════════════════ */
   function startCartPolling() {
-    if (cartPollInterval) return;
+    if (cartPollInterval) return;  // guard against double-start
     cartPollInterval = setInterval(async () => {
       try {
         const r = await fetch(
@@ -338,7 +342,14 @@ window.addEventListener('load', function () {
      so they update the theme's live cart (drawer + count).
      ═══════════════════════════════════════════════════════ */
 
-  /** Extract cart signals embedded by the server in El's text. */
+  /* AJAX CART INTEGRATION
+     These helpers parse action signals and call Shopify's AJAX Cart API
+     (/cart/add.js and /cart/update.js) directly in the browser. Running
+     AJAX calls in the browser is essential because Shopify's session cookie
+     (tying the cart to this visitor) is not available on the Node server. */
+
+  /** Parse legacy [CART_ADD:variantId:qty] and [CART_UPDATE:variantId:qty] tokens
+   *  embedded in El's RTM text. These are a fallback; the primary path is polling. */
   function extractCartSignals(text) {
     const signals = [];
     // [CART_ADD:numericVariantId:qty]
@@ -450,7 +461,10 @@ window.addEventListener('load', function () {
     }
   }
 
-  /** Execute a cart action via Shopify AJAX API with bundled section rendering. */
+  /** Execute a cart action via Shopify AJAX API with bundled section rendering.
+   *  For 'add' and 'update' types, the response includes updated Shopify section
+   *  HTML (cart badge, drawer, etc.) so the page reflects changes immediately
+   *  without a full reload. For 'show_product', delegates to showProductCard(). */
   async function executeCartSignal(signal) {
     try {
       let r;
@@ -523,6 +537,9 @@ window.addEventListener('load', function () {
     }
   }
 
+  /** Fetch /cart.js and POST the normalised item list to /api/cart-state.
+   *  Called after every cart mutation so El's get_cart tool stays accurate.
+   *  Cart prices in /cart.js are in cents, so we divide by 100. */
   async function syncCartState() {
     try {
       const cartRes = await fetch('/cart.js');
@@ -545,9 +562,13 @@ window.addEventListener('load', function () {
 
   /* ═══════════════════════════════════════════════════════
      PRODUCT CARD
-     Embeds product image + info inside the last El bubble.
-     If no El bubble exists yet (image arrived before El speaks),
-     stores it in pendingProduct and flushAiBuffer injects it.
+     Renders an inline product image + title + price inside El's chat bubble.
+
+     Timing challenge: the server queues a show_product action via
+     /api/cart-actions, but the widget's cart poll may fire BEFORE El's
+     text bubble is committed (flushAiBuffer). To bridge the gap, the product
+     data is stored in pendingProduct and injected into the bubble by
+     flushAiBuffer() when it eventually commits the message.
      ═══════════════════════════════════════════════════════ */
   let pendingProduct = null;   // holds { imageUrl, imageAlt, title, price } until next El bubble
 
@@ -572,6 +593,8 @@ window.addEventListener('load', function () {
     scrollEnd();
   }
 
+  /** Queue product data so it is embedded in the NEXT El bubble.
+   *  Never attaches to a previous message — only the upcoming response. */
   function showProductCard(p) {
     if (!p.imageUrl) return;
     // Always queue for the NEXT El bubble — never attach to a previous message.
@@ -580,6 +603,9 @@ window.addEventListener('load', function () {
     console.log('[El img] queued as pendingProduct for next El bubble:', p.title);
   }
 
+  /** Try to fetch a product image from /api/product-image for any product
+   *  name detected in El's spoken text. Uses several regex patterns to
+   *  extract product titles from common sentence structures El uses. */
   async function fetchProductImage(text) {
     const candidates = new Set();
 
@@ -665,8 +691,13 @@ window.addEventListener('load', function () {
 
   /* ═══════════════════════════════════════════════════════
      BUFFER / FLUSH  –  AI message handling
-     bufferAiText() : called for every incoming AI stream packet
-     flushAiBuffer() : commits the fully-formed message to the chat
+     bufferAiText()  : called for every incoming AI stream packet.
+                       Always stores the longest seen text (Agora sends
+                       cumulative text, so later packets supersede earlier).
+                       Shows a typing indicator and resets a debounce timer.
+     flushAiBuffer() : fired when the stream goes quiet for AI_FLUSH_DELAY ms.
+                       Commits the final text as a permanent bubble, injects
+                       any pending product card, and triggers handleAiExtras.
      ═══════════════════════════════════════════════════════ */
   function flushAiBuffer() {
     clearTimeout(aiFlushTmr);
@@ -723,9 +754,6 @@ window.addEventListener('load', function () {
     // User message: flush any pending AI buffer first so the order is correct
     flushAiBuffer();
 
-    if (/checkout|check out|buy now|place order|proceed|pay/i.test(text))
-      userWantsCheckout = true;
-
     if (isDup(text)) return;
 
     const { row } = createRow(text, 'user');
@@ -741,25 +769,24 @@ window.addEventListener('load', function () {
       console.log('[El img] token found:', imgData.title, imgData.imageUrl);
       showProductCard(imgData);
     }
-    // Note: fetchProductImage fallback removed — product cards now come exclusively
-    // via the show_product polling action queued by search_catalog on the server.
-    // This prevents the card from being replaced by regex-guessing on El's text.
-
-    // Checkout button (only if user explicitly asked)
-    const url = extractCheckout(text);
-    if (url && userWantsCheckout) {
-      showCheckoutButton(url);
-      userWantsCheckout = false;
-    }
   }
 
   /* ═══════════════════════════════════════════════════════
      STREAM-MESSAGE PARSER
      Format: <header>|<base64-JSON>
-     Handles:
-       • User ASR  → right-aligned bubble
-       • El speech → left-aligned bubble (buffered)
-       • image_url / product_image fields → inline product card
+     Agora sends a binary stream-message event for each incremental
+     packet of the AI response (and for user ASR transcriptions).
+     The payload is base64-encoded JSON appended after the last '|'.
+
+     This parser:
+       1. Decodes the base64 JSON blob.
+       2. Looks for product image fields → queues product card.
+       3. Drops non-final ASR chunks (partial transcriptions).
+       4. Extracts the text content from whichever field Agora uses.
+       5. Determines whether the text came from the user or from El
+          using multiple heuristics (UID match, object type, data_type…)
+          because Agora's schema varies between SDK versions.
+       6. Routes to addMessage('user') or addMessage('ai') accordingly.
      ═══════════════════════════════════════════════════════ */
   function handleStreamMessage(uid, data) {
     try {
@@ -767,9 +794,6 @@ window.addEventListener('load', function () {
       const b64 = raw.split('|').pop();
       let decoded;
       try { decoded = atob(b64); } catch (e) { return; }
-
-      // VISIBLE log – open DevTools Console to see every packet and tune detection
-      console.log('[El pkt] uid=' + uid + ' | ' + decoded.slice(0, 300));
 
       // ── Product card: El's backend can embed image_url + title + price ──
       const imgMatch = decoded.match(/"(?:image_url|product_image|imageUrl)"\s*:\s*"(https?:[^"]+)"/);
@@ -806,13 +830,10 @@ window.addEventListener('load', function () {
       if (!text || text.length < 2) return;
 
       // ── Determine sender ─────────────────────────────────
-      // Agora CA v2 stamps user UID and/or ASR object type in transcription packets.
-      // Check the console logs above to see the exact format your pipeline uses.
       const isUser =
-        // Numeric UID match: "uid": 123  (number, no quotes)
-        /"uid"\s*:\s*123[,}\s]/.test(decoded) ||
+        new RegExp('"uid"\\s*:\\s*' + BROWSER_UID + '[,}\\s]').test(decoded) ||
         // String UID match: "uid": "123"
-        /"uid"\s*:\s*"123"/.test(decoded) ||
+        new RegExp('"uid"\\s*:\\s*"' + BROWSER_UID + '"').test(decoded) ||
         // ASR object type
         /"object"\s*:\s*"(?:asr|sentence|words|transcription)[._"/]/.test(decoded) ||
         // data_type field
@@ -828,7 +849,8 @@ window.addEventListener('load', function () {
   }
 
   /* ═══════════════════════════════════════════════════════
-     START / STOP
+     START  –  joins the Agora channel, publishes the microphone,
+     wakes the El agent via /api/start-el, and starts cart polling.
      ═══════════════════════════════════════════════════════ */
   async function startEl() {
     isActive = true;
@@ -840,7 +862,6 @@ window.addEventListener('load', function () {
     msgArea.innerHTML = '';
     seenMsgs.clear();
     resetAiBuffer();
-    userWantsCheckout = false;
     // Show "Waking up" directly (bypass buffer – it's a synthetic UI message)
     const { row: wakeRow } = createRow('Waking up El…', 'ai');
     msgArea.appendChild(wakeRow);
@@ -893,6 +914,8 @@ window.addEventListener('load', function () {
     }
   }
 
+  /** Stop El: tear down the Agora session, stop microphone, halt cart polling,
+   *  and tell the server to remove the agent from the channel. */
   async function stopEl() {
     isActive = false;
     elBtn.classList.remove('el-active');
